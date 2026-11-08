@@ -21,7 +21,13 @@ public class VaultCryptoException extends Exception {
         /** Storage read/write failed. */
         IO_ERROR,
         /** The platform does not provide a required algorithm. */
-        UNSUPPORTED_PLATFORM
+        UNSUPPORTED_PLATFORM,
+        /** Data was written by a newer version of the app. It is intact as far as we know but cannot be read yet; never treat it as damaged. */
+        UNSUPPORTED_VERSION,
+        /** A key bundle older than one this device has already accepted was presented (rollback attempt or stale copy). */
+        ROLLBACK_DETECTED,
+        /** The recovery key did not open the key bundle. */
+        WRONG_RECOVERY_KEY
     }
 
     private static final long serialVersionUID = 1L;

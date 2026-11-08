@@ -177,6 +177,23 @@ public final class VaultCrypto {
         return hkdfSha256(masterKey, new byte[0], (SUBKEY_INFO_PREFIX + purpose).getBytes(StandardCharsets.UTF_8), KEY_BYTES);
     }
 
+    /** HMAC-SHA256 over the concatenation of {@code parts}. */
+    public static byte[] hmacSha256(byte[] key, byte[]... parts) throws VaultCryptoException {
+        if (key == null || key.length == 0) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_ARGUMENT, "HMAC key is empty");
+        }
+        try {
+            Mac mac = Mac.getInstance(HMAC);
+            mac.init(new SecretKeySpec(key, HMAC));
+            for (byte[] part : parts) {
+                mac.update(part);
+            }
+            return mac.doFinal();
+        } catch (GeneralSecurityException e) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.UNSUPPORTED_PLATFORM, "HMAC-SHA256 unavailable", e);
+        }
+    }
+
     /** HKDF-SHA256 (RFC 5869). Package-private so tests can run the RFC vectors directly. */
     static byte[] hkdfSha256(byte[] ikm, byte[] salt, byte[] info, int length) throws VaultCryptoException {
         if (length < 1 || length > 255 * HMAC_BYTES) {

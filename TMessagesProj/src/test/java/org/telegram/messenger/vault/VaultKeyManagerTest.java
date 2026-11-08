@@ -93,11 +93,11 @@ public class VaultKeyManagerTest {
 
     @Test
     public void create_lengthIsCountedInCharactersNotUtf16Units() throws Exception {
-        // 7 emoji = 14 UTF-16 units but only 7 characters: must be rejected.
-        String sevenEmoji = rep(new String(Character.toChars(0x1F600)), 7);
+        // 11 emoji = 22 UTF-16 units but only 11 characters: must be rejected.
+        String sevenEmoji = rep(new String(Character.toChars(0x1F600)), 11);
         assertReason(VaultCryptoException.Reason.INVALID_ARGUMENT,
                 () -> manager.createVault(pw(sevenEmoji), pw(sevenEmoji)));
-        String eightEmoji = rep(new String(Character.toChars(0x1F600)), 8);
+        String eightEmoji = rep(new String(Character.toChars(0x1F600)), 12);
         manager.createVault(pw(eightEmoji), pw(eightEmoji));
         assertTrue(manager.isUnlocked());
     }
@@ -192,7 +192,8 @@ public class VaultKeyManagerTest {
         VaultKeyManager bare = new VaultKeyManager(store, new PassThroughWrapper(), TEST_ITERATIONS);
         bare.createVault(pw(PASSWORD), pw(PASSWORD));
         byte[] inner = store.data;
-        assertEquals(VaultKeyManager.INNER_HEADER_LENGTH, inner.length);
+        assertEquals(VaultKeyManager.HEADER_VERSION, inner[4]);
+        assertTrue(inner.length > VaultKeyManager.LEGACY_INNER_HEADER_LENGTH);
         assertEquals("TGVH", new String(inner, 0, 4, StandardCharsets.US_ASCII));
         assertEquals(-1, VaultCryptoTest.indexOf(inner, PASSWORD.getBytes(StandardCharsets.UTF_8)));
         assertEquals(-1, VaultCryptoTest.indexOf(inner, readDataKey(bare)));
@@ -413,7 +414,8 @@ public class VaultKeyManagerTest {
             } catch (VaultCryptoException e) {
                 VaultCryptoException.Reason r = e.getReason();
                 assertTrue("byte " + i + " gave " + r,
-                        r == VaultCryptoException.Reason.CORRUPTED || r == VaultCryptoException.Reason.WRONG_PASSWORD);
+                        r == VaultCryptoException.Reason.CORRUPTED || r == VaultCryptoException.Reason.WRONG_PASSWORD
+                                || (i == 4 && r == VaultCryptoException.Reason.UNSUPPORTED_VERSION));
             }
             assertFalse(bare.isUnlocked());
         }
@@ -629,7 +631,7 @@ public class VaultKeyManagerTest {
 
     /** Reads the manager's private data key array by reflection so tests can verify wiping. */
     private static byte[] readDataKey(VaultKeyManager m) throws Exception {
-        Field f = VaultKeyManager.class.getDeclaredField("dataKey");
+        Field f = VaultKeyManager.class.getDeclaredField("vmk");
         f.setAccessible(true);
         byte[] key = (byte[]) f.get(m);
         assertNotNull("vault must be unlocked", key);

@@ -59,14 +59,20 @@ public final class VaultStore {
         long nowMillis();
     }
 
-    /** Result of {@link #list()}: readable items, plus ids of records that failed to decrypt or parse. */
+    /**
+     * Result of {@link #list()}: readable items, ids of records that failed to decrypt or parse, and ids of
+     * records written by a newer app version (intact as far as we know, shown as "update the app", never
+     * treated as damaged and never deleted automatically).
+     */
     public static final class Listing {
         public final List<VaultItem> items;
         public final List<String> corruptIds;
+        public final List<String> unsupportedIds;
 
-        Listing(List<VaultItem> items, List<String> corruptIds) {
+        Listing(List<VaultItem> items, List<String> corruptIds, List<String> unsupportedIds) {
             this.items = items;
             this.corruptIds = corruptIds;
+            this.unsupportedIds = unsupportedIds;
         }
     }
 
@@ -205,12 +211,15 @@ public final class VaultStore {
         try {
             List<VaultItem> items = new ArrayList<>();
             List<String> corrupt = new ArrayList<>();
+            List<String> unsupported = new ArrayList<>();
             for (String id : recordIds()) {
                 try {
                     items.add(readRecord(messageKey, id, recordFile(id)));
                 } catch (VaultCryptoException e) {
                     if (e.getReason() == VaultCryptoException.Reason.CORRUPTED) {
                         corrupt.add(id);
+                    } else if (e.getReason() == VaultCryptoException.Reason.UNSUPPORTED_VERSION) {
+                        unsupported.add(id);
                     } else {
                         throw e;
                     }
@@ -224,7 +233,8 @@ public final class VaultStore {
                 }
             });
             Collections.sort(corrupt);
-            return new Listing(items, corrupt);
+            Collections.sort(unsupported);
+            return new Listing(items, corrupt, unsupported);
         } finally {
             VaultCrypto.wipe(messageKey);
         }
@@ -376,7 +386,7 @@ public final class VaultStore {
                     }
                 }
             }
-            if (listing.corruptIds.isEmpty()) {
+            if (listing.corruptIds.isEmpty() && listing.unsupportedIds.isEmpty()) {
                 Set<String> referenced = new HashSet<>();
                 for (VaultItem item : listing.items) {
                     if (item.mediaId != null) {
@@ -457,6 +467,9 @@ public final class VaultStore {
             }
         }
         if (content[RECORD_MAGIC.length] != RECORD_VERSION) {
+            if ((content[RECORD_MAGIC.length] & 0xFF) > RECORD_VERSION) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.UNSUPPORTED_VERSION, "Record was written by a newer app version");
+            }
             throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Unsupported record version");
         }
         byte[] blob = new byte[content.length - RECORD_HEADER_BYTES];

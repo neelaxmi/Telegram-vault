@@ -159,8 +159,11 @@ public class VaultItemTest {
         byte[] good = textItem("AAAA").encodePadded();
 
         byte[] badVersion = good.clone();
-        badVersion[4] = 9;
-        assertReason(VaultCryptoException.Reason.CORRUPTED, () -> VaultItem.decodePadded(badVersion));
+        badVersion[4] = 9; // newer than we know: intact data from a newer app, not damage
+        assertReason(VaultCryptoException.Reason.UNSUPPORTED_VERSION, () -> VaultItem.decodePadded(badVersion));
+        byte[] versionZero = good.clone();
+        versionZero[4] = 0;
+        assertReason(VaultCryptoException.Reason.CORRUPTED, () -> VaultItem.decodePadded(versionZero));
 
         byte[] badType = good.clone();
         badType[4 + 1 + 4 + 32] = 99; // version(1) + id string(4 + 32) precede the type byte

@@ -262,7 +262,12 @@ public final class VaultItem {
         }
         try {
             DataInputStream in = new DataInputStream(new ByteArrayInputStream(data, 4, length));
-            if (in.readUnsignedByte() != FORMAT_VERSION) {
+            int version = in.readUnsignedByte();
+            if (version > FORMAT_VERSION) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.UNSUPPORTED_VERSION,
+                        "Item was written by a newer app version");
+            }
+            if (version != FORMAT_VERSION) {
                 throw corrupted("Unsupported record version");
             }
             String id = readString(in);
