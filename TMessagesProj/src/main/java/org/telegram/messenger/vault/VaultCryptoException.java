@@ -27,7 +27,9 @@ public class VaultCryptoException extends Exception {
         /** A key bundle older than one this device has already accepted was presented (rollback attempt or stale copy). */
         ROLLBACK_DETECTED,
         /** The recovery key did not open the key bundle. */
-        WRONG_RECOVERY_KEY
+        WRONG_RECOVERY_KEY,
+        /** The media is larger than the file size Telegram accepts for an upload, so it cannot be synced. */
+        MEDIA_TOO_LARGE
     }
 
     private static final long serialVersionUID = 1L;

@@ -103,6 +103,10 @@ public final class VaultStore {
     private final VaultKeyManager keys;
     private final Clock clock;
     private final int chunkSize;
+    private long maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES;
+
+    /** Telegram's default per-file limit (FileLoader.DEFAULT_MAX_FILE_SIZE, 2000 MiB); Premium accounts get twice that. */
+    public static final long DEFAULT_MAX_UPLOAD_BYTES = 2000L * 1024 * 1024;
 
     public VaultStore(File rootDir, VaultKeyManager keys) {
         this(rootDir, keys, SYSTEM_CLOCK, VaultMediaCipher.DEFAULT_CHUNK_SIZE);
@@ -120,6 +124,26 @@ public final class VaultStore {
         this.keys = keys;
         this.clock = clock;
         this.chunkSize = chunkSize;
+    }
+
+    /**
+     * Sets the largest encrypted file Telegram will accept for this account (decision 6). Media whose
+     * encrypted size would exceed it is refused with MEDIA_TOO_LARGE before anything is stored.
+     */
+    public synchronized void setMaxUploadBytes(long bytes) {
+        if (bytes < 1024 * 1024) {
+            throw new IllegalArgumentException("limit too small");
+        }
+        this.maxUploadBytes = bytes;
+    }
+
+    /** Largest plaintext whose encrypted form (header + 16 bytes of tag per chunk) fits {@code maxUploadBytes}. */
+    long maxPlaintextBytes() {
+        long perChunk = chunkSize + 16L;
+        long fullChunks = (maxUploadBytes - VaultMediaCipher.HEADER_BYTES) / perChunk;
+        long rest = (maxUploadBytes - VaultMediaCipher.HEADER_BYTES) - fullChunks * perChunk;
+        // The final chunk may be partial: it adds its own 16-byte tag, so it holds rest - 16 bytes of data.
+        return fullChunks * chunkSize + Math.max(0, rest - 16);
     }
 
     // ------------------------------------------------------------------ add
@@ -430,6 +454,185 @@ public final class VaultStore {
         }
     }
 
+    // ------------------------------------------------------------------ sync support
+
+    /** Ids of every record file on disk (readable or not), sorted. Used to find items the sync journal does not know yet. */
+    public synchronized List<String> localIds() {
+        List<String> ids = recordIds();
+        Collections.sort(ids);
+        return ids;
+    }
+
+    /** The encrypted record file, exactly the bytes that are uploaded. May not exist. */
+    synchronized File recordCipherFile(String id) throws VaultCryptoException {
+        checkId(id);
+        return recordFile(id);
+    }
+
+    /** The encrypted media or thumbnail file, exactly the bytes that are uploaded. May not exist (evicted or not downloaded). */
+    synchronized File mediaCipherFile(String mediaId) throws VaultCryptoException {
+        checkId(mediaId);
+        return mediaFile(mediaId);
+    }
+
+    public synchronized boolean hasMediaFile(String mediaId) throws VaultCryptoException {
+        checkId(mediaId);
+        return mediaFile(mediaId).isFile();
+    }
+
+    /**
+     * Stores a record that came from the server. The bytes must authenticate under this vault's key for
+     * exactly this id, otherwise nothing is stored. A record written by a newer app version is stored
+     * (so it is kept and re-synced) as long as it authenticates. An existing record is never overwritten.
+     *
+     * @return true if it was stored, false if a record with this id already exists
+     * @throws VaultCryptoException CORRUPTED if the bytes are not an authentic record of this vault;
+     *                              UNSUPPORTED_VERSION if the container version is unknown (not stored)
+     */
+    public synchronized boolean importRecord(String id, byte[] content) throws VaultCryptoException {
+        checkId(id);
+        if (content == null || content.length > MAX_RECORD_FILE_BYTES) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Remote record has an invalid size");
+        }
+        byte[] messageKey = keys.deriveSubkey(PURPOSE_MESSAGES);
+        File tmp = null;
+        try {
+            ensureDirs();
+            if (recordFile(id).isFile()) {
+                return false;
+            }
+            tmp = new File(itemsDir(), id + RECORD_EXT + TMP_EXT);
+            try {
+                VaultFiles.writeAtomically(tmp, content);
+            } catch (IOException e) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not store remote record", e);
+            }
+            try {
+                readRecord(messageKey, id, tmp);
+            } catch (VaultCryptoException e) {
+                // A record from a newer app is authentic but unreadable here: keep it. Everything else is rejected.
+                if (e.getReason() != VaultCryptoException.Reason.UNSUPPORTED_VERSION || !authenticates(messageKey, id, content)) {
+                    throw e;
+                }
+            }
+            try {
+                VaultFiles.renameOver(tmp, recordFile(id));
+            } catch (IOException e) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not store remote record", e);
+            }
+            tmp = null;
+            return true;
+        } finally {
+            VaultCrypto.wipe(messageKey);
+            if (tmp != null) {
+                VaultFiles.deleteQuietly(tmp);
+            }
+        }
+    }
+
+    /** True if {@code content} is a record container whose AES-GCM blob authenticates for {@code id}. */
+    private static boolean authenticates(byte[] messageKey, String id, byte[] content) {
+        if (content.length < RECORD_HEADER_BYTES) {
+            return false;
+        }
+        for (int i = 0; i < RECORD_MAGIC.length; i++) {
+            if (content[i] != RECORD_MAGIC[i]) {
+                return false;
+            }
+        }
+        try {
+            byte[] blob = new byte[content.length - RECORD_HEADER_BYTES];
+            System.arraycopy(content, RECORD_HEADER_BYTES, blob, 0, blob.length);
+            VaultCrypto.wipe(VaultCrypto.decrypt(messageKey, blob, recordAad(id)));
+            return true;
+        } catch (VaultCryptoException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Stores media or a thumbnail that was downloaded from the server. The whole stream is authenticated
+     * (header, every chunk, end marker) before the file becomes visible, so a truncated or altered download
+     * leaves nothing behind.
+     *
+     * @param mediaId       id taken from the record (media id or thumbnail id)
+     * @param expectedBytes plaintext size the record promises, or -1 to skip the size check (thumbnails)
+     */
+    public synchronized void importMedia(String mediaId, InputStream encrypted, long expectedBytes) throws VaultCryptoException {
+        checkId(mediaId);
+        byte[] mediaKey = keys.deriveSubkey(PURPOSE_MEDIA);
+        File tmp = null;
+        boolean ok = false;
+        try {
+            ensureDirs();
+            tmp = new File(mediaDir(), mediaId + MEDIA_EXT + TMP_EXT);
+            try (FileOutputStream fos = new FileOutputStream(tmp);
+                 BufferedOutputStream bos = new BufferedOutputStream(fos, 64 * 1024)) {
+                byte[] buffer = new byte[64 * 1024];
+                int n;
+                while ((n = encrypted.read(buffer)) > 0) {
+                    bos.write(buffer, 0, n);
+                }
+                bos.flush();
+                fos.getFD().sync();
+            } catch (IOException e) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not store downloaded media", e);
+            }
+            long plain;
+            try (InputStream in = new FileInputStream(tmp)) {
+                plain = VaultMediaCipher.decrypt(in, new NullOutputStream(), mediaKey, mediaAad(mediaId));
+            } catch (IOException e) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not verify downloaded media", e);
+            }
+            if (expectedBytes >= 0 && plain != expectedBytes) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Downloaded media has the wrong size");
+            }
+            try {
+                VaultFiles.renameOver(tmp, mediaFile(mediaId));
+            } catch (IOException e) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not store downloaded media", e);
+            }
+            ok = true;
+        } finally {
+            VaultCrypto.wipe(mediaKey);
+            if (!ok && tmp != null) {
+                VaultFiles.deleteQuietly(tmp);
+            }
+        }
+    }
+
+    /**
+     * Removes the local copy of an item's media (not its record or thumbnail) to free space. The caller must
+     * know the media is safely on the server. @return bytes freed, 0 if there was nothing to evict.
+     */
+    public synchronized long evictMedia(String itemId) throws VaultCryptoException {
+        VaultItem item = requireItem(itemId);
+        if (item.mediaId == null) {
+            return 0;
+        }
+        File f = mediaFile(item.mediaId);
+        long size = f.length();
+        if (!f.isFile()) {
+            return 0;
+        }
+        try {
+            VaultFiles.secureDelete(f);
+        } catch (IOException e) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not evict media", e);
+        }
+        return size;
+    }
+
+    private static final class NullOutputStream extends OutputStream {
+        @Override
+        public void write(int b) {
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) {
+        }
+    }
+
     // ------------------------------------------------------------------ internals: records
 
     private void writeRecord(byte[] messageKey, VaultItem item, List<File> created) throws VaultCryptoException {
@@ -505,14 +708,55 @@ public final class VaultStore {
             long size;
             try (FileOutputStream fos = new FileOutputStream(tmp);
                  BufferedOutputStream bos = new BufferedOutputStream(fos, 64 * 1024)) {
-                size = VaultMediaCipher.encrypt(source, bos, mediaKey, mediaAad(mediaId), chunkSize);
+                size = VaultMediaCipher.encrypt(new LimitedInputStream(source, maxPlaintextBytes()), bos,
+                        mediaKey, mediaAad(mediaId), chunkSize);
                 bos.flush();
                 fos.getFD().sync();
             }
             VaultFiles.renameOver(tmp, dest);
             return size;
+        } catch (TooLargeException e) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.MEDIA_TOO_LARGE,
+                    "This file is larger than Telegram allows, so it cannot be saved to the Vault", e);
         } catch (IOException e) {
             throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not store media", e);
+        }
+    }
+
+    private static final class TooLargeException extends IOException {
+        private static final long serialVersionUID = 1L;
+    }
+
+    /** Fails with {@link TooLargeException} as soon as more than {@code limit} bytes have been read. */
+    private static final class LimitedInputStream extends InputStream {
+        private final InputStream in;
+        private final long limit;
+        private long read;
+
+        LimitedInputStream(InputStream in, long limit) {
+            this.in = in;
+            this.limit = limit;
+        }
+
+        @Override
+        public int read() throws IOException {
+            int b = in.read();
+            if (b >= 0 && ++read > limit) {
+                throw new TooLargeException();
+            }
+            return b;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            int n = in.read(buffer, offset, length);
+            if (n > 0) {
+                read += n;
+                if (read > limit) {
+                    throw new TooLargeException();
+                }
+            }
+            return n;
         }
     }
 
