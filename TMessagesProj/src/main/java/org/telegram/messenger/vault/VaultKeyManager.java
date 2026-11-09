@@ -326,6 +326,41 @@ public final class VaultKeyManager {
         }
     }
 
+    // ------------------------------------------------------------------ device linking
+
+    /** The VMK and bundle to hand to a new device that the user has approved. Unlocked v2 vaults only. */
+    synchronized byte[] exportVmkForLink() throws VaultCryptoException {
+        requireV2();
+        return vmk.clone();
+    }
+
+    /**
+     * Installs a vault received from another device through {@link DeviceLink}. The bundle must authenticate
+     * under the received VMK. Sets a new local password for this device and unlocks.
+     */
+    synchronized void restoreFromLink(byte[] linkedVmk, byte[] bundleBytes, char[] newPassword, char[] confirmation,
+                                      boolean replaceExisting) throws VaultCryptoException {
+        if (store.exists() && !replaceExisting) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE, "This device already has a vault");
+        }
+        if (linkedVmk == null || linkedVmk.length != VaultCrypto.KEY_BYTES) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_ARGUMENT, "Invalid key");
+        }
+        validateNewPassword(newPassword, confirmation);
+        VaultBundle.verify(bundleBytes, linkedVmk);
+        VaultBundle.Info info = VaultBundle.peek(bundleBytes);
+        byte[] salt = VaultCrypto.randomBytes(VaultCrypto.SALT_BYTES);
+        byte[] kek = null;
+        try {
+            kek = VaultCrypto.deriveKey(newPassword, salt, iterations);
+            writeHeaderV2(salt, kek, linkedVmk, info.vaultId, info.bundleVersion, bundleBytes);
+            install(linkedVmk.clone(), info.vaultId, info.bundleVersion, bundleBytes.clone(), false);
+        } finally {
+            VaultCrypto.wipe(kek);
+            VaultCrypto.wipe(salt);
+        }
+    }
+
     // ------------------------------------------------------------------ password change
 
     /**

@@ -29,7 +29,11 @@ public class VaultCryptoException extends Exception {
         /** The recovery key did not open the key bundle. */
         WRONG_RECOVERY_KEY,
         /** The media is larger than the file size Telegram accepts for an upload, so it cannot be synced. */
-        MEDIA_TOO_LARGE
+        MEDIA_TOO_LARGE,
+        /** A device-link session ran past its time limit. */
+        LINK_EXPIRED,
+        /** A device-link message did not match what the sender committed to; the session is cancelled (possible attack). */
+        LINK_MISMATCH
     }
 
     private static final long serialVersionUID = 1L;
