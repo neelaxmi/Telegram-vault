@@ -33,7 +33,9 @@ public class VaultCryptoException extends Exception {
         /** A device-link session ran past its time limit. */
         LINK_EXPIRED,
         /** A device-link message did not match what the sender committed to; the session is cancelled (possible attack). */
-        LINK_MISMATCH
+        LINK_MISMATCH,
+        /** Too many wrong passwords: this device's local Vault data and keys were deleted (remote data and other devices are untouched). */
+        VAULT_WIPED
     }
 
     private static final long serialVersionUID = 1L;
