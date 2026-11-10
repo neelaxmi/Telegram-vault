@@ -15,7 +15,7 @@ import java.util.Map;
  * In-memory stand-in for the Telegram channel with fault injection. It models only what
  * {@link VaultRemoteStore} promises; whether the real channel keeps those promises is untested here.
  */
-final class FakeRemoteStore implements VaultRemoteStore {
+class FakeRemoteStore implements VaultRemoteStore {
 
     private final List<Entry> entries = new ArrayList<>();
     private final Map<String, byte[]> blobs = new HashMap<>();
