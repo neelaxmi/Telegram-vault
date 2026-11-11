@@ -34,6 +34,17 @@ public final class SetupFlow {
         step = Step.SHOW_KEY;
     }
 
+    /**
+     * Upgrade of a vault from the first phases (unlocked, old header): verifies the old password again and sets a
+     * new one (at least {@value VaultKeyManager#MIN_PASSWORD_LENGTH} characters). From here on the steps are the
+     * same as for a new vault, and no stored item is touched.
+     */
+    public synchronized void submitMigration(char[] oldPassword, char[] newPassword, char[] confirmation) throws VaultCryptoException {
+        require(Step.PASSWORD);
+        setup = keys.beginMigration(oldPassword, newPassword, confirmation);
+        step = Step.SHOW_KEY;
+    }
+
     /** The key to display. Only available while it is being shown or confirmed. */
     public synchronized String recoveryKeyText() throws VaultCryptoException {
         if (step != Step.SHOW_KEY && step != Step.CONFIRM_KEY) {

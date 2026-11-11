@@ -38,6 +38,14 @@ public final class TelegramVaultChannel {
     private TelegramVaultChannel() {
     }
 
+    /**
+     * True once the account's chat list has been loaded. Before that, {@link #find} returning null does NOT mean
+     * the channel does not exist (e.g. just after login on a new phone), so nothing may be created yet.
+     */
+    public static boolean chatsLoaded(int account) {
+        return MessagesController.getInstance(account).dialogsLoaded;
+    }
+
     /** The existing channel from the locally known chats, or null. Non-blocking. */
     public static Ref find(int account) {
         MessagesController controller = MessagesController.getInstance(account);
