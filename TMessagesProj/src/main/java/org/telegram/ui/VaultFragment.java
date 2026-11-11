@@ -1,6 +1,7 @@
 package org.telegram.ui;
 
 import android.app.Activity;
+import android.app.Dialog;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
@@ -25,7 +26,7 @@ import android.widget.TextView;
 
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.UserConfig;
-import org.telegram.messenger.vault.RecoveryKey;
+import org.telegram.messenger.vault.LinkTransport;
 import org.telegram.messenger.vault.RemoteBundle;
 import org.telegram.messenger.vault.SetupFlow;
 import org.telegram.messenger.vault.SyncCoordinator;
@@ -245,6 +246,10 @@ public class VaultFragment extends BaseFragment {
                 return "This device's secure key is unavailable. Restore the Vault with your recovery key.";
             case VAULT_WIPED:
                 return "Too many wrong passwords. This device's Vault data was deleted. Your data on Telegram's server was not touched; restore it with your recovery key.";
+            case LINK_EXPIRED:
+                return "The linking session ran out of time. Start again on both phones.";
+            case LINK_MISMATCH:
+                return "Linking was stopped because a message did not match. If the codes did not match, someone may be interfering; start again.";
             case MEDIA_TOO_LARGE:
                 return "That file is larger than Telegram allows.";
             default:
@@ -274,7 +279,11 @@ public class VaultFragment extends BaseFragment {
 
     /** Runs {@code job} on the Vault thread; errors go to {@code error}, success to {@code done}, both on the UI thread. */
     private void background(final Job job, final Runnable done, final ErrorHandler error) {
-        rt.io().execute(new Runnable() {
+        backgroundOn(rt.io(), job, done, error);
+    }
+
+    private void backgroundOn(java.util.concurrent.Executor executor, final Job job, final Runnable done, final ErrorHandler error) {
+        executor.execute(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -338,6 +347,12 @@ public class VaultFragment extends BaseFragment {
             }
         }));
         if (!migrate) {
+            p.addView(button(c, "I already have a Vault on another phone: link this phone", new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    showLinkJoinForm();
+                }
+            }));
             p.addView(button(c, "I already have a Vault: restore with recovery key", new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
@@ -1002,6 +1017,180 @@ public class VaultFragment extends BaseFragment {
         });
     }
 
+
+    // ------------------------------------------------------------------ device linking
+
+    private LinkTransport.Approver approverRun;
+    private LinkTransport.Joiner joinerRun;
+
+    /** Existing device: waits for a new phone, shows the code, sends the key only after the user approves. */
+    private void startApproving() {
+        final Context c = getParentActivity();
+        final TextView status = text(c, "Open the Vault on the new phone and choose \"link this phone\". Waiting for it\u2026", 15, false);
+        final AlertDialog.Builder b = new AlertDialog.Builder(c);
+        b.setTitle("Link a new device");
+        b.setView(status);
+        b.setNegativeButton("Cancel", new AlertDialog.OnButtonClickListener() {
+            @Override
+            public void onClick(AlertDialog d, int which) {
+                if (approverRun != null) {
+                    approverRun.cancel();
+                }
+            }
+        });
+        final Dialog dialog = showDialog(b.create());
+        final VaultRuntime run = rt;
+        approverRun = new LinkTransport.Approver(rt.remote(), rt.keys, rt.workDir());
+        final LinkTransport.Approver a = approverRun;
+        backgroundOn(rt.linkIo(), new Job() {
+            @Override
+            public void run() throws Exception {
+                try {
+                    a.awaitRequest();
+                    final String code = a.awaitCode();
+                    ui(new Runnable() {
+                        @Override
+                        public void run() {
+                            dialog.dismiss();
+                            confirmCode(code, a);
+                        }
+                    });
+                } catch (VaultCryptoException e) {
+                    a.cleanup();
+                    throw e;
+                }
+            }
+        }, null, new ErrorHandler() {
+            @Override
+            public void accept(VaultCryptoException e) {
+                dialog.dismiss();
+                if (e.getReason() != VaultCryptoException.Reason.INVALID_STATE) {
+                    toast(messageFor(e));
+                }
+            }
+        });
+    }
+
+    private void confirmCode(String code, final LinkTransport.Approver a) {
+        AlertDialog.Builder b = new AlertDialog.Builder(getParentActivity());
+        b.setTitle("Does the other phone show this code?");
+        TextView t = text(getParentActivity(), code, 34, true);
+        t.setGravity(Gravity.CENTER);
+        t.setTypeface(Typeface.MONOSPACE);
+        b.setView(t);
+        b.setPositiveButton("Yes, the codes match", new AlertDialog.OnButtonClickListener() {
+            @Override
+            public void onClick(AlertDialog d, int which) {
+                backgroundOn(rt.linkIo(), new Job() {
+                    @Override
+                    public void run() throws Exception {
+                        try {
+                            a.approve();
+                        } finally {
+                            a.cleanup();
+                        }
+                    }
+                }, new Runnable() {
+                    @Override
+                    public void run() {
+                        toast("The new phone is being linked.");
+                    }
+                }, new ErrorHandler() {
+                    @Override
+                    public void accept(VaultCryptoException e) {
+                        toast(messageFor(e));
+                    }
+                });
+            }
+        });
+        b.setNegativeButton("No, they differ", new AlertDialog.OnButtonClickListener() {
+            @Override
+            public void onClick(AlertDialog d, int which) {
+                a.cancel();
+                backgroundOn(rt.linkIo(), new Job() {
+                    @Override
+                    public void run() {
+                        a.cleanup();
+                    }
+                }, null, new ErrorHandler() {
+                    @Override
+                    public void accept(VaultCryptoException e) {
+                    }
+                });
+                toast("Linking cancelled. If the codes differed, do not try again on this network.");
+            }
+        });
+        showDialog(b.create());
+    }
+
+    /** New device: choose this phone's password first, then compare the code and wait for approval. */
+    private void showLinkJoinForm() {
+        final Context c = container.getContext();
+        LinearLayout p = page(c);
+        p.addView(text(c, "Link this phone", 22, true));
+        p.addView(text(c, "Choose a password for THIS phone (12+ characters). Then open the Vault on your other phone, go to Settings, and choose \"Link a new device\" first. Start here after that.", 15, false));
+        final EditText pw = field(c, "Password (12+ characters)", true);
+        final EditText pw2 = field(c, "Repeat password", true);
+        final TextView status = text(c, "", 15, false);
+        p.addView(pw);
+        p.addView(pw2);
+        p.addView(status);
+        p.addView(button(c, "Start", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                final char[] a1 = chars(pw);
+                final char[] a2 = chars(pw2);
+                if (a1.length < 12 || !java.util.Arrays.equals(a1, a2)) {
+                    status.setText("The password needs at least 12 characters and both entries must match.");
+                    return;
+                }
+                status.setText("Contacting your other phone\u2026");
+                joinerRun = null;
+                backgroundOn(rt.linkIo(), new Job() {
+                    @Override
+                    public void run() throws Exception {
+                        rt.attachChannel(null, false);
+                        final LinkTransport.Joiner j = new LinkTransport.Joiner(rt.remote(), rt.workDir());
+                        joinerRun = j;
+                        try {
+                            final String code = j.awaitCode();
+                            ui(new Runnable() {
+                                @Override
+                                public void run() {
+                                    status.setText("Check that your other phone shows this code, then tap \"Yes, the codes match\" there:\n\n" + code);
+                                }
+                            });
+                            j.awaitGrantAndInstall(rt.keys, a1, a2, false);
+                        } finally {
+                            j.cleanup();
+                        }
+                    }
+                }, new Runnable() {
+                    @Override
+                    public void run() {
+                        rt.unlocked();
+                        showList();
+                    }
+                }, new ErrorHandler() {
+                    @Override
+                    public void accept(VaultCryptoException e) {
+                        status.setText(messageFor(e));
+                    }
+                });
+            }
+        }));
+        p.addView(button(c, "Cancel", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (joinerRun != null) {
+                    joinerRun.cancel();
+                }
+                decide();
+            }
+        }));
+        show(p);
+    }
+
     // ------------------------------------------------------------------ settings
 
     private void showSettings() {
@@ -1036,6 +1225,12 @@ public class VaultFragment extends BaseFragment {
             public void accept(VaultCryptoException e) {
             }
         });
+        p.addView(button(c, "Link a new device\u2026", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startApproving();
+            }
+        }));
         AlertDialog.Builder b = new AlertDialog.Builder(c);
         b.setTitle("Vault settings");
         b.setView(p);

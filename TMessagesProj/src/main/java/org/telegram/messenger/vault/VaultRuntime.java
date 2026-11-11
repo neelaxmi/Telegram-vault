@@ -32,6 +32,7 @@ public final class VaultRuntime {
     public final AutoLock autoLock;
     private final File dir;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final ExecutorService linkIo = Executors.newSingleThreadExecutor();
     private volatile VaultSyncEngine engine;
     private volatile VaultRemoteStore remote;
     private volatile SyncCoordinator.Listener uiListener;
@@ -80,6 +81,16 @@ public final class VaultRuntime {
 
     public ExecutorService io() {
         return io;
+    }
+
+    /** Separate thread for device linking: it waits for the other phone for minutes and must not block syncing. */
+    public ExecutorService linkIo() {
+        return linkIo;
+    }
+
+    /** Where link helper files go. */
+    public File workDir() {
+        return dir;
     }
 
     /** Called (on the UI thread) when the Vault locks itself or is locked manually, so open screens can close. */
