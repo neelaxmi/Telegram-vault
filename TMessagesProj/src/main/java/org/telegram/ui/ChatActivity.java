@@ -1213,6 +1213,7 @@ public class ChatActivity extends BaseFragment implements
     public final static int OPTION_RETRY = 0;
     public final static int OPTION_DELETE = 1;
     public final static int OPTION_FORWARD = 2;
+    public final static int OPTION_SEND_TO_VAULT = 9001;
     public final static int OPTION_COPY = 3;
     public final static int OPTION_SAVE_TO_GALLERY = 4;
     public final static int OPTION_APPLY_LOCALIZATION_OR_THEME = 5;
@@ -33642,6 +33643,18 @@ public class ChatActivity extends BaseFragment implements
                 createDeleteMessagesAlert(selectedObject, selectedObjectGroup, true);
                 break;
             }
+            case OPTION_SEND_TO_VAULT: {
+                final MessageObject toVault = selectedObject;
+                selectedObject = null;
+                selectedObjectToEditCaption = null;
+                selectedObjectGroup = null;
+                VaultSender.send(currentAccount, toVault, vaultMessage -> {
+                    if (getParentActivity() != null) {
+                        android.widget.Toast.makeText(getParentActivity(), vaultMessage, android.widget.Toast.LENGTH_LONG).show();
+                    }
+                });
+                break;
+            }
             case OPTION_FORWARD: {
                 if (getMessagesController().isFrozen()) {
                     AccountFrozenAlert.show(currentAccount);
@@ -46571,6 +46584,11 @@ public class ChatActivity extends BaseFragment implements
                     items.add(LocaleController.getString(R.string.Forward));
                     options.add(OPTION_FORWARD);
                     icons.add(R.drawable.msg_forward);
+                }
+                if (chatMode == 0 && !isInScheduleMode() && VaultSender.isAllowed(currentAccount, selectedObject)) {
+                    items.add("\uD83D\uDD10 Send to Vault");
+                    options.add(OPTION_SEND_TO_VAULT);
+                    icons.add(R.drawable.msg_secret);
                 }
                 if (allowUnpin) {
                     items.add(LocaleController.getString(R.string.UnpinMessage));
