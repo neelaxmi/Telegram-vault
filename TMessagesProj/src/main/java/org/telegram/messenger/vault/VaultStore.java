@@ -449,6 +449,7 @@ public final class VaultStore {
         try {
             VaultFiles.secureDeleteTree(itemsDir());
             VaultFiles.secureDeleteTree(mediaDir());
+            VaultFiles.secureDeleteTree(new File(rootDir, "rotation")); // a half-finished key rotation keeps a re-encrypted copy
         } catch (IOException e) {
             throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not delete vault data", e);
         }

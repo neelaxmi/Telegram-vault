@@ -100,12 +100,23 @@ public class VaultFragment extends BaseFragment {
         if (flow != null) {
             flow.cancel();
         }
+        if (rotationPlan != null) {
+            rotationPlan.cancel();
+            rotationPlan = null;
+        }
+        Activity act = getParentActivity();
+        if (act != null) {
+            act.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE); // other Telegram screens are not secured
+        }
         rt.setOnLockedUi(null);
         super.onFragmentDestroy();
     }
 
     @Override
     public android.view.View createView(Context context) {
+        if (getParentActivity() != null) {
+            getParentActivity().getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
+        }
         actionBar.setBackButtonImage(org.telegram.messenger.R.drawable.ic_ab_back);
         actionBar.setAllowOverlayTitle(true);
         actionBar.setTitle("Protected Vault");
@@ -147,10 +158,8 @@ public class VaultFragment extends BaseFragment {
     @Override
     public void onPause() {
         super.onPause();
-        Activity a = getParentActivity();
-        if (a != null) {
-            a.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
-        }
+        // FLAG_SECURE stays on while this screen exists, including while the app is in the background, so the
+        // Recents thumbnail is blank. It is cleared in onFragmentDestroy.
         if (flow != null) {
             flow.cancel(); // never leave the recovery key on screen while away
             flow = null;
@@ -226,6 +235,7 @@ public class VaultFragment extends BaseFragment {
         e.setSingleLine(true);
         e.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
         e.setHintTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteHintText));
+        e.setImeOptions(android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
         e.setInputType(InputType.TYPE_CLASS_TEXT | (password ? InputType.TYPE_TEXT_VARIATION_PASSWORD : InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS));
         return e;
     }
@@ -1425,6 +1435,7 @@ public class VaultFragment extends BaseFragment {
                 } catch (RuntimeException e) {
                     toast("Inactivity time not changed: use 10 to 86400 seconds.");
                 }
+                rt.saveAutoLockSettings();
                 final boolean w = wipe.isChecked();
                 background(new Job() {
                     @Override

@@ -97,6 +97,8 @@
     <application
         android:name="org.telegram.messenger.ApplicationLoader"
         android:allowBackup="true"
+        android:fullBackupContent="@xml/vault_backup_rules"
+        android:dataExtractionRules="@xml/vault_data_extraction_rules"
         android:restoreAnyVersion="true"
         android:backupAgent=".BackupAgent"
         android:hardwareAccelerated="true"

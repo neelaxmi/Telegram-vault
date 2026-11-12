@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Protected Vault (Android 12+): excluded from cloud backup and from device-to-device transfer. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="vault" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="vault" />
+    </device-transfer>
+</data-extraction-rules>

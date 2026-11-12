@@ -719,4 +719,14 @@ public class KeyRotationTest {
         assertEquals("x", a.store.get(t.id).text);
         assertFalse(VaultSyncEngine.recoverRotation(a.store, a.keys, new File(a.dir, "journal")));
     }
+
+    @Test
+    public void localWipeAlsoRemovesAHalfFinishedRotationsStagedCopy() throws Exception {
+        addText(a, "x");
+        a.engine.sync();
+        crashAt("marked");
+        assertTrue(new File(a.dir, "vault/rotation").exists());
+        a.store.deleteAllData();
+        assertFalse(new File(a.dir, "vault/rotation").exists());
+    }
 }

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Protected Vault: nothing under files/vault is ever copied into a backup or a device transfer.
+     The files are ciphertext, but the key that opens them lives in this phone's hardware keystore and cannot be
+     restored elsewhere, so a restored copy would only be unreadable data. Everything else keeps its default. -->
+<full-backup-content>
+    <exclude domain="file" path="vault" />
+</full-backup-content>

@@ -1,5 +1,7 @@
 package org.telegram.messenger.vault;
 
+import android.content.Context;
+import android.content.SharedPreferences;
 import android.os.SystemClock;
 
 import org.telegram.messenger.AndroidUtilities;
@@ -78,6 +80,30 @@ public final class VaultRuntime {
                 return SystemClock.elapsedRealtime(); // monotonic: wall-clock changes cannot extend an unlocked period
             }
         });
+        loadAutoLockSettings();
+    }
+
+    // The lock settings hold no secrets; they are kept so that a shorter timeout the user chose survives a restart.
+    private SharedPreferences settings() {
+        return ApplicationLoader.applicationContext.getSharedPreferences("vault_settings_" + account, Context.MODE_PRIVATE);
+    }
+
+    private void loadAutoLockSettings() {
+        SharedPreferences p = settings();
+        autoLock.setLockOnBackground(p.getBoolean("lock_on_background", true));
+        try {
+            autoLock.setInactivityMillis(p.getLong("inactivity_millis", AutoLock.DEFAULT_INACTIVITY_MILLIS));
+        } catch (IllegalArgumentException e) {
+            // an out-of-range stored value falls back to the default
+        }
+    }
+
+    /** Persists the current auto-lock settings. */
+    public void saveAutoLockSettings() {
+        settings().edit()
+                .putBoolean("lock_on_background", autoLock.isLockOnBackground())
+                .putLong("inactivity_millis", autoLock.getInactivityMillis())
+                .apply();
     }
 
     public ExecutorService io() {

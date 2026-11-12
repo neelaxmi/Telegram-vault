@@ -1,5 +1,7 @@
 package org.telegram.messenger.vault;
 
+import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.NotificationsController;
 import org.telegram.messenger.ChatObject;
 import org.telegram.messenger.MessagesController;
 import org.telegram.tgnet.ConnectionsManager;
@@ -75,6 +77,9 @@ public final class TelegramVaultChannel {
         MessagesController.getInstance(account).processUpdates(updates, false);
         for (TLRPC.Chat chat : updates.chats) {
             if (chat != null && TITLE.equals(chat.title) && ChatObject.isChannel(chat) && !ChatObject.isMegagroup(chat)) {
+                // Storage objects are silent already; muting keeps the channel from ever raising a notification.
+                final long dialogId = -chat.id;
+                AndroidUtilities.runOnUIThread(() -> NotificationsController.getInstance(account).muteUntil(dialogId, 0, Integer.MAX_VALUE));
                 return new Ref(chat.id, chat.access_hash);
             }
         }
