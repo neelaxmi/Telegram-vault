@@ -111,7 +111,9 @@ jobs:
       - name: Locate APK
         id: apk
         run: |
-          apk=$(find TMessagesProj_App/build/outputs/apk -name '*.apk' | head -n 1)
+          echo "All APK files in the workspace:"
+          find . -name '*.apk' -not -path './.gradle/*' -printf '%p  %s bytes\n'
+          apk=$(find . -name 'app.apk' -path '*debug*' -not -path './.gradle/*' | head -n 1)
           test -n "$apk"
           ls -l "$apk"
           echo "path=$apk" >> "$GITHUB_OUTPUT"
