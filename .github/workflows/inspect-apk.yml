@@ -1,11 +1,15 @@
 name: Inspect built APK
 
 on:
+  push:
+    branches: [protected-vault-phase1]
+    paths: ['.github/workflows/inspect-apk.yml']
   workflow_dispatch:
     inputs:
       run_id:
         description: 'Run id of an "Android build" run whose telegram-vault-debug-apk artifact should be inspected'
-        required: true
+        required: false
+        default: '43193839495'
 
 permissions:
   contents: read
@@ -19,7 +23,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: telegram-vault-debug-apk
-          run-id: ${{ github.event.inputs.run_id }}
+          run-id: ${{ github.event.inputs.run_id || '43193839495' }}
           github-token: ${{ github.token }}
           path: apk
       - name: Install build-tools

@@ -6,6 +6,7 @@ on:
     paths-ignore:
       - 'docs/**'
       - '**/*.md'
+      - '.github/workflows/inspect-apk.yml'
   workflow_dispatch:
     inputs:
       abis:
