@@ -44,10 +44,10 @@ jobs:
       - name: Signature
         run: |
           cd apk
-          "$BT/apksigner" verify --verbose --print-certs app.apk || echo "apksigner exit code $?"
+          "$BT/apksigner" verify --verbose --print-certs app.apk 2>&1 | grep -v "^WARNING: META-INF" || echo "apksigner exit code $?"
           echo "--- certificate details (jarsigner view)"
           mkdir x && cd x && unzip -q ../app.apk 'META-INF/*' && ls -l META-INF
-          for f in META-INF/*.RSA META-INF/*.DSA META-INF/*.EC; do [ -f "$f" ] && keytool -printcert -file "$f"; done
+          for f in META-INF/*.RSA META-INF/*.DSA META-INF/*.EC; do if [ -f "$f" ]; then keytool -printcert -file "$f" | head -12; fi; done
       - name: Manifest, package, SDK, ABI
         run: |
           cd apk
