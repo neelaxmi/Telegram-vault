@@ -113,6 +113,10 @@ jobs:
           target: google_apis
           disable-animations: true
           script: |
+            echo "=== install exactly like the normal installer (no -t flag)"
+            adb install -r apk/app.apk 2>&1 | tee install-plain.log || true
+            adb uninstall org.telegram.messenger.beta > /dev/null 2>&1 || true
+            echo "=== install allowing test-only packages (-t)"
             adb install -r -t apk/app.apk 2>&1 | tee install.log || true
             echo "--- packages"; adb shell pm list packages | grep telegram || true
             echo "--- logcat install related"; adb logcat -d | grep -iE "PackageInstaller|PackageManager|INSTALL_" | tail -20 || true
