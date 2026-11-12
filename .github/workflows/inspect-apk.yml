@@ -70,3 +70,49 @@ jobs:
         run: |
           cd apk
           "$BT/aapt2" dump permissions app.apk | grep -iE "REQUEST_INSTALL_PACKAGES|BIND_ACCESSIBILITY|SYSTEM_ALERT_WINDOW|READ_SMS|RECEIVE_SMS|SEND_SMS|CALL_LOG|MANAGE_EXTERNAL_STORAGE|READ_CONTACTS|BIND_DEVICE_ADMIN|PACKAGE_USAGE" || true
+
+      - name: Raw manifest header and application attributes
+        run: |
+          cd apk
+          "$BT/aapt2" dump badging app.apk | head -6 | cut -c1-260
+          echo "--- uses-sdk element"
+          grep -n -A6 "E: uses-sdk" ../manifest.txt | cut -c1-200
+          echo "--- manifest root attributes"
+          sed -n 1,25p ../manifest.txt | cut -c1-200
+          echo "--- application attributes"
+          grep -n -A40 "E: application" ../manifest.txt | grep -E "A: " | head -30 | cut -c1-200
+          echo "--- sharedUserId?"; grep -c sharedUserId ../manifest.txt || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-under-test
+          path: apk/app.apk
+          retention-days: 3
+
+  install-test:
+    name: Install on Android emulator
+    needs: inspect
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [34, 35]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk-under-test
+          path: apk
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api }}
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: |
+            adb install -r -t apk/app.apk 2>&1 | tee install.log || true
+            echo "--- packages"; adb shell pm list packages | grep telegram || true
+            echo "--- logcat install related"; adb logcat -d | grep -iE "PackageInstaller|PackageManager|INSTALL_" | tail -20 || true
