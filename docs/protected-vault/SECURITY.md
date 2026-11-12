@@ -1,6 +1,6 @@
 # Security notes
 
-Status: designed and unit-tested on a JVM; **not reviewed by an independent cryptographer, not run on a device,
+Status: designed and unit-tested on a JVM; **not reviewed by an independent cryptographer, the full app compiles in CI but has not been run on a device,
 not tested against Telegram's servers.** Do not rely on it for anything that matters before that has happened.
 
 ## What it is meant to protect against
