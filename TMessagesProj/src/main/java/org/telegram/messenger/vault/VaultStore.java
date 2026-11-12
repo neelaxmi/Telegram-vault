@@ -623,6 +623,192 @@ public final class VaultStore {
         return size;
     }
 
+    // ------------------------------------------------------------------ key rotation support
+
+    /**
+     * Re-encrypts every record, thumbnail and media file under new keys into {@code stageRoot/items} and
+     * {@code stageRoot/media}, leaving the live files untouched. Everything staged is read back and
+     * authenticated with the new keys before this returns. Plaintext media never touches the disk.
+     *
+     * Refuses (and cleans up) if any record cannot be read, or if an item's media or thumbnail is not on this
+     * device: those would be lost by a rotation.
+     *
+     * @return number of items staged
+     */
+    synchronized int stageReencrypted(File stageRoot, byte[] newMessageKey, byte[] newMediaKey) throws VaultCryptoException {
+        byte[] oldMessageKey = keys.deriveSubkey(PURPOSE_MESSAGES);
+        byte[] oldMediaKey = keys.deriveSubkey(PURPOSE_MEDIA);
+        boolean ok = false;
+        try {
+            File stageItems = new File(stageRoot, ITEMS_DIR);
+            File stageMedia = new File(stageRoot, MEDIA_DIR);
+            if (!stageItems.isDirectory() && !stageItems.mkdirs() || !stageMedia.isDirectory() && !stageMedia.mkdirs()) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not create staging directory");
+            }
+            int count = 0;
+            for (String id : recordIds()) {
+                VaultItem item;
+                try {
+                    item = readRecord(oldMessageKey, id, recordFile(id));
+                } catch (VaultCryptoException e) {
+                    if (e.getReason() == VaultCryptoException.Reason.CORRUPTED
+                            || e.getReason() == VaultCryptoException.Reason.UNSUPPORTED_VERSION) {
+                        throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE,
+                                "An item cannot be read, so the keys cannot be rotated safely", e);
+                    }
+                    throw e;
+                }
+                if (item.mediaId != null) {
+                    reencryptMedia(mediaFile(item.mediaId), new File(stageMedia, item.mediaId + MEDIA_EXT),
+                            oldMediaKey, newMediaKey, mediaAad(item.mediaId), item.mediaSize);
+                }
+                if (item.thumbnailId != null) {
+                    reencryptMedia(mediaFile(item.thumbnailId), new File(stageMedia, item.thumbnailId + MEDIA_EXT),
+                            oldMediaKey, newMediaKey, mediaAad(item.thumbnailId), -1);
+                }
+                writeRecordFile(newMessageKey, item, new File(stageItems, id + RECORD_EXT));
+                VaultItem back = readRecord(newMessageKey, id, new File(stageItems, id + RECORD_EXT));
+                if (!back.equals(item)) {
+                    throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Re-encrypted record does not match");
+                }
+                count++;
+            }
+            ok = true;
+            return count;
+        } finally {
+            VaultCrypto.wipe(oldMessageKey);
+            VaultCrypto.wipe(oldMediaKey);
+            if (!ok) {
+                try {
+                    VaultFiles.secureDeleteTree(stageRoot);
+                } catch (IOException ignored) {
+                    // best effort: the staged files are ciphertext under a key that is discarded with the rotation
+                }
+            }
+        }
+    }
+
+    /**
+     * Replaces the live {@code items} and {@code media} directories with the staged ones. Safe to run again
+     * after a crash: each directory that is still staged is swapped in, the others are left alone.
+     */
+    synchronized void adoptStaged(File stageRoot) throws VaultCryptoException {
+        try {
+            for (String name : new String[]{ITEMS_DIR, MEDIA_DIR}) {
+                File staged = new File(stageRoot, name);
+                if (!staged.isDirectory()) {
+                    continue;
+                }
+                File live = new File(rootDir, name);
+                VaultFiles.secureDeleteTree(live);
+                if (!staged.renameTo(live)) {
+                    throw new IOException("Could not move staged " + name + " into place");
+                }
+            }
+        } catch (IOException e) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not switch to the re-encrypted data", e);
+        }
+    }
+
+    /** Directory under which a rotation stages its re-encrypted copy (same file system as the live data, so it can be renamed in). */
+    File stagingRoot() {
+        return rootDir;
+    }
+
+    private void reencryptMedia(final File source, File dest, final byte[] oldKey, byte[] newKey, final byte[] aad,
+                                final long expectedPlain) throws VaultCryptoException {
+        if (!source.isFile()) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE,
+                    "A file is not stored on this device, so the keys cannot be rotated yet");
+        }
+        final java.io.PipedInputStream pipeIn = new java.io.PipedInputStream(128 * 1024);
+        final java.io.PipedOutputStream pipeOut;
+        try {
+            pipeOut = new java.io.PipedOutputStream(pipeIn);
+        } catch (IOException e) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not start re-encryption", e);
+        }
+        final Throwable[] failure = new Throwable[1];
+        final long[] plain = new long[]{-1};
+        Thread reader = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try (InputStream in = new FileInputStream(source)) {
+                    plain[0] = VaultMediaCipher.decrypt(in, pipeOut, oldKey, aad);
+                } catch (Throwable t) {
+                    failure[0] = t;
+                } finally {
+                    try {
+                        pipeOut.close();
+                    } catch (IOException ignored) {
+                        // nothing left to do
+                    }
+                }
+            }
+        }, "vault-rotate-media");
+        reader.start();
+        VaultCryptoException problem = null;
+        try (FileOutputStream fos = new FileOutputStream(dest);
+             BufferedOutputStream bos = new BufferedOutputStream(fos, 64 * 1024)) {
+            VaultMediaCipher.encrypt(pipeIn, bos, newKey, aad, chunkSize);
+            bos.flush();
+            fos.getFD().sync();
+        } catch (VaultCryptoException e) {
+            problem = e;
+        } catch (IOException e) {
+            problem = new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not re-encrypt media", e);
+        } finally {
+            try {
+                pipeIn.close(); // unblocks the reader if the writer gave up
+            } catch (IOException ignored) {
+                // nothing left to do
+            }
+        }
+        try {
+            reader.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Interrupted while re-encrypting media", e);
+        }
+        // The reader's verdict wins: a decryption failure there would otherwise look like a short, valid file.
+        if (failure[0] != null) {
+            if (failure[0] instanceof VaultCryptoException) {
+                throw (VaultCryptoException) failure[0];
+            }
+            throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not read media", failure[0]);
+        }
+        if (problem != null) {
+            throw problem;
+        }
+        if (expectedPlain >= 0 && plain[0] != expectedPlain) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Media size does not match record");
+        }
+        // Read the staged file back with the new key: it must authenticate completely and have the same size.
+        try (InputStream in = new FileInputStream(dest)) {
+            long check = VaultMediaCipher.decrypt(in, new NullOutputStream(), newKey, aad);
+            if (check != plain[0]) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Re-encrypted media does not match");
+            }
+        } catch (IOException e) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not verify re-encrypted media", e);
+        }
+    }
+
+    private void writeRecordFile(byte[] messageKey, VaultItem item, File target) throws VaultCryptoException {
+        byte[] padded = item.encodePadded();
+        byte[] blob = VaultCrypto.encrypt(messageKey, padded, recordAad(item.id));
+        VaultCrypto.wipe(padded);
+        byte[] content = new byte[RECORD_HEADER_BYTES + blob.length];
+        System.arraycopy(RECORD_MAGIC, 0, content, 0, RECORD_MAGIC.length);
+        content[RECORD_MAGIC.length] = RECORD_VERSION;
+        System.arraycopy(blob, 0, content, RECORD_HEADER_BYTES, blob.length);
+        try {
+            VaultFiles.writeAtomically(target, content);
+        } catch (IOException e) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.IO_ERROR, "Could not store item", e);
+        }
+    }
+
     private static final class NullOutputStream extends OutputStream {
         @Override
         public void write(int b) {

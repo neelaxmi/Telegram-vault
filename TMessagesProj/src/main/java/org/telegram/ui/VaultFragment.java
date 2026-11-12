@@ -35,6 +35,7 @@ import org.telegram.messenger.vault.VaultCryptoException;
 import org.telegram.messenger.vault.VaultItem;
 import org.telegram.messenger.vault.VaultListModel;
 import org.telegram.messenger.vault.VaultRuntime;
+import org.telegram.messenger.vault.VaultSyncEngine;
 import org.telegram.messenger.vault.VaultStore;
 import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
@@ -182,6 +183,10 @@ public class VaultFragment extends BaseFragment {
             flow = null;
         }
         restoreBundle = null;
+        if (rotationPlan != null) {
+            rotationPlan.cancel();
+            rotationPlan = null;
+        }
         model = null;
         adapter = null;
         container.removeAllViews();
@@ -828,7 +833,7 @@ public class VaultFragment extends BaseFragment {
                 t = "Sync paused, will retry (" + s.pendingItems + " waiting)";
                 break;
             case NEEDS_RESTORE:
-                t = "This Vault was changed from another device. Restore with your recovery key.";
+                t = "The keys were rotated on another device. Tap here to restore with the new recovery key.";
                 break;
             case SECURITY_ERROR:
                 t = "Sync stopped: the server data failed a security check (" + s.error + ").";
@@ -840,6 +845,12 @@ public class VaultFragment extends BaseFragment {
                 t = s.pendingItems > 0 ? s.pendingItems + " waiting to sync" : "Synced";
         }
         statusView.setText(t);
+        statusView.setOnClickListener(s.state == SyncCoordinator.State.NEEDS_RESTORE ? new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showAdoptForm();
+            }
+        } : null);
     }
 
     private void syncNow(boolean force) {
@@ -1191,6 +1202,171 @@ public class VaultFragment extends BaseFragment {
         show(p);
     }
 
+    // ------------------------------------------------------------------ key rotation
+
+    private VaultSyncEngine.RotationPlan rotationPlan;
+
+    /** Settings entry: explains what rotation does, asks for the password, then prepares the new keys. */
+    private void startRotation() {
+        final Context c = getParentActivity();
+        LinearLayout p = page(c);
+        p.addView(text(c, "This creates a NEW master key and a NEW recovery key. Your old recovery key stops working, and the old copy on Telegram's servers is replaced by one under the new key.", 14, false));
+        p.addView(text(c, "Before you start: open the Vault on your other devices and let them finish syncing. After the rotation each of them must be restored with the NEW recovery key; anything saved on them that had not synced is lost. Keep this screen open: it needs a network connection and can take a while for a large Vault.", 14, false));
+        p.addView(text(c, "Rotating cannot take back what a lost or stolen device has already read. It protects what you save from now on.", 14, false));
+        final EditText pw = field(c, "Your Vault password", true);
+        p.addView(pw);
+        AlertDialog.Builder b = new AlertDialog.Builder(c);
+        b.setTitle("Rotate keys");
+        b.setView(p);
+        b.setPositiveButton("Continue", new AlertDialog.OnButtonClickListener() {
+            @Override
+            public void onClick(AlertDialog d, int which) {
+                final char[] password = chars(pw);
+                toast("Preparing\u2026 this downloads anything not on this phone first.");
+                backgroundOn(rt.linkIo(), new Job() {
+                    @Override
+                    public void run() throws Exception {
+                        final VaultSyncEngine.RotationPlan plan = rt.engine().beginKeyRotation(password);
+                        ui(new Runnable() {
+                            @Override
+                            public void run() {
+                                rotationPlan = plan;
+                                showRotationKey();
+                            }
+                        });
+                    }
+                }, null, new ErrorHandler() {
+                    @Override
+                    public void accept(VaultCryptoException e) {
+                        toast(messageFor(e));
+                    }
+                });
+            }
+        });
+        b.setNegativeButton("Cancel", null);
+        showDialog(b.create());
+    }
+
+    private void showRotationKey() {
+        final Context c = container.getContext();
+        final VaultSyncEngine.RotationPlan plan = rotationPlan;
+        LinearLayout p = page(c);
+        p.addView(text(c, "Your NEW recovery key", 22, true));
+        p.addView(text(c, "Write this down on paper and replace the old one. It is shown only now. Then type it below to prove you have it; nothing changes before that.", 15, false));
+        TextView key = text(c, plan.recoveryKey().format(), 18, true);
+        key.setTypeface(Typeface.MONOSPACE);
+        key.setTextIsSelectable(false);
+        p.addView(key);
+        final EditText typed = field(c, "New recovery key", false);
+        final TextView err = text(c, "", 14, false);
+        err.setTextColor(Theme.getColor(Theme.key_text_RedRegular));
+        p.addView(typed);
+        p.addView(err);
+        p.addView(button(c, "Rotate keys", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                final String t = typed.getText().toString();
+                err.setText("Working\u2026 do not close the Vault.");
+                backgroundOn(rt.linkIo(), new Job() {
+                    @Override
+                    public void run() throws Exception {
+                        rt.engine().finishKeyRotation(plan, t);
+                    }
+                }, new Runnable() {
+                    @Override
+                    public void run() {
+                        rotationPlan = null;
+                        toast("Keys rotated. Your data is being uploaded under the new key.");
+                        syncNow(true);
+                        showList();
+                    }
+                }, new ErrorHandler() {
+                    @Override
+                    public void accept(VaultCryptoException e) {
+                        err.setText(messageFor(e));
+                        if (e.getReason() != VaultCryptoException.Reason.WRONG_RECOVERY_KEY
+                                && e.getReason() != VaultCryptoException.Reason.INVALID_ARGUMENT) {
+                            // anything else ended the attempt; nothing was switched, a new attempt starts from scratch
+                            plan.cancel();
+                            rotationPlan = null;
+                        }
+                    }
+                });
+            }
+        }));
+        p.addView(button(c, "Cancel", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                plan.cancel();
+                rotationPlan = null;
+                showList();
+            }
+        }));
+        show(p);
+    }
+
+    /**
+     * This device's keys were replaced by a rotation on another device. The recovery key (the new one) and a
+     * new password for this phone restore it; the local copy is wiped first and downloaded again.
+     */
+    private void showAdoptForm() {
+        final Context c = container.getContext();
+        LinearLayout p = page(c);
+        p.addView(text(c, "Restore after a key rotation", 22, true));
+        p.addView(text(c, "The keys of this Vault were rotated on another device. Enter the NEW recovery key and choose a password for this phone (12+ characters). This phone's local copy is replaced by a fresh download; anything saved here that had not synced is lost.", 15, false));
+        final EditText key = field(c, "New recovery key", false);
+        final EditText pw = field(c, "New password", true);
+        final EditText pw2 = field(c, "Repeat password", true);
+        final TextView err = text(c, "", 14, false);
+        err.setTextColor(Theme.getColor(Theme.key_text_RedRegular));
+        p.addView(key);
+        p.addView(pw);
+        p.addView(pw2);
+        p.addView(err);
+        p.addView(button(c, "Restore", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                final String k = key.getText().toString();
+                final char[] a1 = chars(pw);
+                final char[] a2 = chars(pw2);
+                err.setText("Working\u2026");
+                backgroundOn(rt.linkIo(), new Job() {
+                    @Override
+                    public void run() throws Exception {
+                        byte[] latest = RemoteBundle.fetchLatest(rt.remote());
+                        if (latest == null) {
+                            throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE, "No key bundle on the server");
+                        }
+                        rt.engine().adoptNewKeyEpoch(latest, k, a1, a2);
+                    }
+                }, new Runnable() {
+                    @Override
+                    public void run() {
+                        rt.unlocked();
+                        SyncCoordinator sc = rt.coordinator();
+                        if (sc != null) {
+                            sc.clearBlockingState();
+                        }
+                        syncNow(true);
+                        showList();
+                    }
+                }, new ErrorHandler() {
+                    @Override
+                    public void accept(VaultCryptoException e) {
+                        err.setText(messageFor(e));
+                    }
+                });
+            }
+        }));
+        p.addView(button(c, "Back", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showList();
+            }
+        }));
+        show(p);
+    }
+
     // ------------------------------------------------------------------ settings
 
     private void showSettings() {
@@ -1229,6 +1405,12 @@ public class VaultFragment extends BaseFragment {
             @Override
             public void onClick(View v) {
                 startApproving();
+            }
+        }));
+        p.addView(button(c, "Rotate keys\u2026", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startRotation();
             }
         }));
         AlertDialog.Builder b = new AlertDialog.Builder(c);

@@ -63,7 +63,8 @@ final class SyncJournal {
     }
 
     private static final byte[] MAGIC = {'T', 'G', 'V', 'J'};
-    private static final byte VERSION = 1;
+    private static final byte VERSION = 2;
+    private static final byte VERSION_V1 = 1;
     private static final byte[] AAD = "tg-vault/journal/v1".getBytes(StandardCharsets.US_ASCII);
     private static final long MAX_FILE_BYTES = 64L * 1024 * 1024;
     private static final int MAX_COUNT = 5_000_000;
@@ -75,6 +76,11 @@ final class SyncJournal {
     final Map<String, ItemState> items = new TreeMap<>();
     /** Server records written by a newer app that could not be imported yet: name -> reference. */
     final Map<String, String> skipped = new LinkedHashMap<>();
+    /**
+     * Server references from an earlier key epoch (before a key rotation) that must be deleted once the
+     * re-encrypted objects are on the server. They are never downloaded or trusted.
+     */
+    final java.util.Set<String> retired = new java.util.LinkedHashSet<>();
 
     /** @return an empty journal if the file does not exist; CORRUPTED if it exists but cannot be authenticated or parsed */
     static SyncJournal load(File file, byte[] key) throws VaultCryptoException {
@@ -87,7 +93,7 @@ final class SyncJournal {
         } catch (IOException e) {
             throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Journal unreadable", e);
         }
-        if (content.length < MAGIC.length + 1 || content[MAGIC.length] != VERSION) {
+        if (content.length < MAGIC.length + 1 || (content[MAGIC.length] != VERSION && content[MAGIC.length] != VERSION_V1)) {
             throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Journal header invalid");
         }
         for (int i = 0; i < MAGIC.length; i++) {
@@ -99,7 +105,7 @@ final class SyncJournal {
         System.arraycopy(content, MAGIC.length + 1, blob, 0, blob.length);
         byte[] payload = VaultCrypto.decrypt(key, blob, AAD);
         try {
-            return parse(payload);
+            return parse(payload, content[MAGIC.length] == VERSION);
         } catch (IOException e) {
             throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Journal malformed", e);
         } finally {
@@ -156,11 +162,15 @@ final class SyncJournal {
             out.writeUTF(e.getKey());
             out.writeUTF(e.getValue());
         }
+        out.writeInt(retired.size());
+        for (String ref : retired) {
+            out.writeUTF(ref);
+        }
         out.flush();
         return bytes.toByteArray();
     }
 
-    private static SyncJournal parse(byte[] payload) throws IOException, VaultCryptoException {
+    private static SyncJournal parse(byte[] payload, boolean hasRetired) throws IOException, VaultCryptoException {
         DataInputStream in = new DataInputStream(new ByteArrayInputStream(payload));
         SyncJournal j = new SyncJournal();
         j.cursor = in.readLong();
@@ -186,6 +196,12 @@ final class SyncJournal {
         int skippedCount = count(in);
         for (int i = 0; i < skippedCount; i++) {
             j.skipped.put(in.readUTF(), in.readUTF());
+        }
+        if (hasRetired) {
+            int retiredCount = count(in);
+            for (int i = 0; i < retiredCount; i++) {
+                j.retired.add(in.readUTF());
+            }
         }
         if (in.available() != 0) {
             throw new IOException("trailing bytes");

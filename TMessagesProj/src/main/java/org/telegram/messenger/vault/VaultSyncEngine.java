@@ -377,7 +377,9 @@ public final class VaultSyncEngine {
                 if (e.seq <= s.journal.cursor) {
                     throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Server returned entries out of order");
                 }
-                if (e.name != null && e.name.startsWith("b.")) {
+                if (s.journal.retired.contains(e.ref)) {
+                    // An object from before a key rotation, waiting to be deleted: never read, never trusted.
+                } else if (e.name != null && e.name.startsWith("b.")) {
                     int version = parseVersion(e.name);
                     if (version > newestBundle) {
                         newestBundle = version;
@@ -526,6 +528,11 @@ public final class VaultSyncEngine {
             report.rejectedRemote++;
             return;
         }
+        if (parseVersion(e.name) < keys.getBundleVersion() && s.journal.bundleUploadedVersion < keys.getBundleVersion()) {
+            // We rotated our keys and have not published the new bundle yet, so an older one on the server is
+            // expected. The push step uploads ours next; until then nothing is taken from this one.
+            return;
+        }
         VaultKeyManager.BundleStatus status = keys.checkRemoteBundle(bytes); // throws ROLLBACK_DETECTED / CORRUPTED / INVALID_STATE
         if (status == VaultKeyManager.BundleStatus.NEWER) {
             report.needsRestore = true;
@@ -561,6 +568,35 @@ public final class VaultSyncEngine {
             } else if (st.state == SyncJournal.State.DELETE_PENDING) {
                 finishDelete(s, e.getKey(), st, report);
             }
+        }
+        removeRetired(s, report);
+    }
+
+    /**
+     * After a key rotation: deletes the server objects of the old key epoch, but only once the new bundle and
+     * every item are on the server under the new key, so the server always holds a complete copy.
+     */
+    private void removeRetired(Session s, SyncReport report) throws VaultCryptoException {
+        SyncJournal j = s.journal;
+        if (j.retired.isEmpty() || j.bundleUploadedVersion < keys.getBundleVersion() || report.incompleteLocal > 0
+                || report.skippedUnreadableLocal > 0) {
+            return;
+        }
+        for (SyncJournal.ItemState st : j.items.values()) {
+            if (st.state == SyncJournal.State.PENDING_UPLOAD || st.state == SyncJournal.State.DELETE_PENDING) {
+                return;
+            }
+        }
+        for (String ref : new ArrayList<>(j.retired)) {
+            try {
+                remote.delete(ref);
+            } catch (IOException e) {
+                s.save();
+                throw io("Could not delete an old server object", e);
+            }
+            j.retired.remove(ref);
+            report.remoteObjectsDeleted++;
+            s.save();
         }
     }
 
@@ -650,6 +686,290 @@ public final class VaultSyncEngine {
         st.state = SyncJournal.State.DELETED;
         st.parts = new ArrayList<>();
         s.save();
+    }
+
+    // ------------------------------------------------------------------ key rotation
+
+    /** Test seam: called at named points of a rotation; a test throws a RuntimeException to simulate a crash. Null in production. */
+    interface RotationFault {
+        void at(String stage);
+    }
+
+    RotationFault rotationFault;
+
+    private void fault(String stage) {
+        RotationFault f = rotationFault;
+        if (f != null) {
+            f.at(stage);
+        }
+    }
+
+    private static final String ROTATION_DIR = "rotation";
+    private static final String ROTATION_JOURNAL = "journal.bin";
+    private static final String ROTATION_MARKER = "COMMIT";
+
+    /** A rotation that has been prepared; the user must now confirm the new recovery key. */
+    public static final class RotationPlan {
+        private final VaultKeyManager.Rotation rotation;
+
+        private RotationPlan(VaultKeyManager.Rotation rotation) {
+            this.rotation = rotation;
+        }
+
+        /** The new recovery key to show once. */
+        public RecoveryKey recoveryKey() {
+            return rotation.recoveryKey();
+        }
+
+        public void cancel() {
+            rotation.cancel();
+        }
+    }
+
+    /**
+     * Rotation step 1: makes sure this device is fully in step with the server and holds every file, then
+     * creates the new keys. Nothing is changed yet. Needs the password again.
+     *
+     * Refuses (INVALID_STATE / UNSUPPORTED_VERSION) if the server holds a newer key epoch, records from a newer
+     * app, unreadable items or media that is neither here nor on the server: rotating then would lose data.
+     */
+    public synchronized RotationPlan beginKeyRotation(char[] password) throws VaultCryptoException {
+        recoverInterruptedRotation();
+        prepareForRotation();
+        return new RotationPlan(keys.beginRotation(password));
+    }
+
+    /**
+     * Rotation step 2: after the user typed the new recovery key back. Re-encrypts everything on this device
+     * under the new key, switches over atomically (a crash is finished or rolled back at the next unlock) and
+     * queues the re-upload. Call {@link #sync()} afterwards: it publishes the new bundle, uploads every item
+     * under the new key and only then deletes the old server objects.
+     */
+    public synchronized void finishKeyRotation(RotationPlan plan, String typedRecoveryKey) throws VaultCryptoException {
+        plan.rotation.confirm(typedRecoveryKey);
+        recoverInterruptedRotation();
+        prepareForRotation(); // pulls anything that arrived since step 1
+        File dir = new File(store.stagingRoot(), ROTATION_DIR);
+        Session s = open();
+        byte[] newMessageKey = null;
+        byte[] newMediaKey = null;
+        byte[] newJournalKey = null;
+        boolean committed = false;
+        try {
+            // Items deleted but not announced yet: their server objects are retired below, nothing to announce.
+            for (Map.Entry<String, SyncJournal.ItemState> e : s.journal.items.entrySet()) {
+                if (e.getValue().state == SyncJournal.State.DELETE_PENDING && store.recordCipherFile(e.getKey()).isFile()) {
+                    store.delete(e.getKey());
+                }
+            }
+            SyncJournal next = new SyncJournal();
+            next.cursor = s.journal.cursor;
+            next.bundleUploadedVersion = 0;
+            next.retired.addAll(s.journal.retired);
+            next.retired.addAll(s.journal.refs.values());
+            for (Map.Entry<String, SyncJournal.ItemState> e : s.journal.items.entrySet()) {
+                SyncJournal.State old = e.getValue().state;
+                boolean gone = old == SyncJournal.State.DELETED || old == SyncJournal.State.DELETE_PENDING;
+                SyncJournal.ItemState st = new SyncJournal.ItemState(gone ? SyncJournal.State.DELETED : SyncJournal.State.PENDING_UPLOAD);
+                st.lastAccessMillis = e.getValue().lastAccessMillis;
+                next.items.put(e.getKey(), st);
+            }
+            for (String id : store.localIds()) {
+                if (!next.items.containsKey(id)) {
+                    next.items.put(id, new SyncJournal.ItemState(SyncJournal.State.PENDING_UPLOAD));
+                }
+            }
+
+            deleteTree(dir);
+            newMessageKey = plan.rotation.deriveSubkey(VaultStore.PURPOSE_MESSAGES);
+            newMediaKey = plan.rotation.deriveSubkey(VaultStore.PURPOSE_MEDIA);
+            newJournalKey = plan.rotation.deriveSubkey(PURPOSE_JOURNAL);
+            store.stageReencrypted(dir, newMessageKey, newMediaKey);
+            next.save(new File(dir, ROTATION_JOURNAL), newJournalKey);
+            fault("staged");
+            writeMarker(dir, plan.rotation.bundleVersion());
+            fault("marked");
+
+            keys.commitRotation(plan.rotation); // the point of no return: the header now holds the new key
+            committed = true;
+            fault("committed");
+            completeRotation(dir);
+        } catch (VaultCryptoException e) {
+            if (!committed) {
+                deleteTree(dir); // nothing was switched; the old data is untouched
+            }
+            throw e;
+        } finally {
+            VaultCrypto.wipe(newMessageKey);
+            VaultCrypto.wipe(newMediaKey);
+            VaultCrypto.wipe(newJournalKey);
+            s.close();
+        }
+    }
+
+    /**
+     * For a device whose keys were replaced by a rotation on another device (the server holds a newer key
+     * bundle). The recovery key must open that bundle and the password is checked BEFORE anything is deleted.
+     * Then this device's local copy (encrypted under the old key and no longer readable) is wiped and the
+     * device is set up again under the new key with a new password; the next sync downloads everything.
+     * Items that were saved here but never reached the server are lost.
+     */
+    public synchronized void adoptNewKeyEpoch(byte[] newerBundle, String recoveryKeyText, char[] newPassword,
+                                              char[] confirmation) throws VaultCryptoException {
+        VaultKeyManager.validateNewPassword(newPassword, confirmation);
+        RecoveryKey key = RecoveryKey.parse(recoveryKeyText);
+        try {
+            VaultCrypto.wipe(VaultBundle.openWithRecoveryKey(newerBundle, key));
+        } finally {
+            key.wipe();
+        }
+        if (keys.checkRemoteBundle(newerBundle) != VaultKeyManager.BundleStatus.NEWER) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE, "That key bundle is not newer than this device's");
+        }
+        store.deleteAllData();
+        deleteTree(new File(store.stagingRoot(), ROTATION_DIR));
+        if (journalFile.exists() && !journalFile.delete()) {
+            throw io("Could not remove the old sync journal", new IOException("delete failed"));
+        }
+        keys.restoreFromBundle(newerBundle, recoveryKeyText, newPassword, confirmation, true);
+    }
+
+    /**
+     * Finishes or rolls back a rotation that a crash interrupted. Needs the vault unlocked. Called
+     * automatically before every rotation step and by the runtime right after unlocking.
+     *
+     * @return true if an interrupted rotation was completed
+     */
+    public synchronized boolean recoverInterruptedRotation() throws VaultCryptoException {
+        return recoverRotation(store, keys, journalFile, rotationFault);
+    }
+
+    /**
+     * Same as {@link #recoverInterruptedRotation()} without needing an engine (so it works before the Vault
+     * channel is attached). The runtime calls it right after unlocking.
+     */
+    public static boolean recoverRotation(VaultStore store, VaultKeyManager keys, File journalFile) throws VaultCryptoException {
+        return recoverRotation(store, keys, journalFile, null);
+    }
+
+    static boolean recoverRotation(VaultStore store, VaultKeyManager keys, File journalFile, RotationFault fault) throws VaultCryptoException {
+        File dir = new File(store.stagingRoot(), ROTATION_DIR);
+        if (!dir.exists()) {
+            return false;
+        }
+        int target = readMarker(dir);
+        if (target < 0) {
+            deleteTree(dir); // staging was never completed: nothing was switched
+            return false;
+        }
+        int have = keys.getBundleVersion();
+        if (have == target) {
+            completeRotation(store, journalFile, dir, fault);
+            return true;
+        }
+        if (have == target - 1) {
+            deleteTree(dir); // the header was never switched: keep the old data
+            return false;
+        }
+        throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Interrupted rotation does not match the vault");
+    }
+
+    private void completeRotation(File dir) throws VaultCryptoException {
+        completeRotation(store, journalFile, dir, rotationFault);
+    }
+
+    private static void completeRotation(VaultStore store, File journalFile, File dir, RotationFault fault) throws VaultCryptoException {
+        store.adoptStaged(dir);
+        if (fault != null) {
+            fault.at("adopted");
+        }
+        try {
+            VaultFiles.renameOver(new File(dir, ROTATION_JOURNAL), journalFile);
+        } catch (IOException e) {
+            throw io("Could not switch the sync journal", e);
+        }
+        deleteTree(dir);
+    }
+
+    private void prepareForRotation() throws VaultCryptoException {
+        SyncReport report = sync();
+        if (report.needsRestore) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE,
+                    "Another device already changed the keys. Restore with the recovery key first.");
+        }
+        if (report.skippedUnsupported > 0) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.UNSUPPORTED_VERSION,
+                    "Some items were saved by a newer app version. Update the app before rotating the keys.");
+        }
+        if (report.incompleteLocal > 0 || report.skippedUnreadableLocal > 0 || !report.lostMedia.isEmpty()) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE,
+                    "Some items are damaged or incomplete, so the keys cannot be rotated safely.");
+        }
+        Session s = open();
+        try {
+            if (!s.journal.skipped.isEmpty()) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.UNSUPPORTED_VERSION,
+                        "Some items were saved by a newer app version. Update the app before rotating the keys.");
+            }
+            VaultStore.Listing listing = store.list();
+            if (!listing.corruptIds.isEmpty() || !listing.unsupportedIds.isEmpty()) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE,
+                        "Some items are damaged, so the keys cannot be rotated safely.");
+            }
+            for (VaultItem item : listing.items) {
+                if (item.thumbnailId != null) {
+                    ensureLocal(s, thumbName(item.thumbnailId), item.thumbnailId, -1);
+                }
+                if (item.mediaId != null) {
+                    ensureLocal(s, mediaName(item.mediaId), item.mediaId, item.mediaSize);
+                }
+            }
+        } finally {
+            s.close();
+        }
+    }
+
+    private void writeMarker(File dir, int targetVersion) throws VaultCryptoException {
+        byte[] data = new byte[8];
+        data[0] = 'R';
+        data[1] = 'O';
+        data[2] = 'T';
+        data[3] = '1';
+        data[4] = (byte) (targetVersion >>> 24);
+        data[5] = (byte) (targetVersion >>> 16);
+        data[6] = (byte) (targetVersion >>> 8);
+        data[7] = (byte) targetVersion;
+        try {
+            VaultFiles.writeAtomically(new File(dir, ROTATION_MARKER), data);
+        } catch (IOException e) {
+            throw io("Could not record the rotation", e);
+        }
+    }
+
+    /** @return the target bundle version, or -1 if there is no valid marker */
+    private static int readMarker(File dir) {
+        File f = new File(dir, ROTATION_MARKER);
+        if (!f.isFile()) {
+            return -1;
+        }
+        try {
+            byte[] d = VaultFiles.readBounded(f, 64);
+            if (d.length != 8 || d[0] != 'R' || d[1] != 'O' || d[2] != 'T' || d[3] != '1') {
+                return -1;
+            }
+            int v = ((d[4] & 0xFF) << 24) | ((d[5] & 0xFF) << 16) | ((d[6] & 0xFF) << 8) | (d[7] & 0xFF);
+            return v < 2 ? -1 : v;
+        } catch (IOException e) {
+            return -1;
+        }
+    }
+
+    private static void deleteTree(File dir) throws VaultCryptoException {
+        try {
+            VaultFiles.secureDeleteTree(dir);
+        } catch (IOException e) {
+            throw io("Could not remove temporary rotation files", e);
+        }
     }
 
     // ------------------------------------------------------------------ helpers

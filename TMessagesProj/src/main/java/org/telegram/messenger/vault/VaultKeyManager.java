@@ -287,6 +287,145 @@ public final class VaultKeyManager {
         }
     }
 
+    // ------------------------------------------------------------------ key rotation
+
+    /**
+     * A key rotation waiting for the user to write down and confirm the NEW recovery key. It holds a fresh
+     * VMK (same vault id, next bundle version) and a fresh recovery key. Nothing is written until
+     * {@link #commitRotation}. Single use.
+     */
+    public static final class Rotation {
+        private final byte[] newVmk;
+        private final byte[] vaultId;
+        private final int bundleVersion;
+        private final byte[] salt;
+        private final byte[] kek;
+        private final byte[] bundle;
+        private final RecoveryKey recoveryKey;
+        private boolean confirmed;
+        private boolean finished;
+
+        private Rotation(byte[] newVmk, byte[] vaultId, int bundleVersion, byte[] salt, byte[] kek, byte[] bundle, RecoveryKey recoveryKey) {
+            this.newVmk = newVmk;
+            this.vaultId = vaultId;
+            this.bundleVersion = bundleVersion;
+            this.salt = salt;
+            this.kek = kek;
+            this.bundle = bundle;
+            this.recoveryKey = recoveryKey;
+        }
+
+        /** The new recovery key, to be shown once. Must not be logged or stored. */
+        public synchronized RecoveryKey recoveryKey() {
+            return recoveryKey;
+        }
+
+        public synchronized int bundleVersion() {
+            return bundleVersion;
+        }
+
+        /** The user types the new recovery key back. Only a match allows the rotation to proceed. */
+        public synchronized void confirm(String typedRecoveryKey) throws VaultCryptoException {
+            if (finished) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE, "Rotation already finished");
+            }
+            RecoveryKey typed = RecoveryKey.parse(typedRecoveryKey);
+            try {
+                if (!recoveryKey.sameKeyAs(typed)) {
+                    throw new VaultCryptoException(VaultCryptoException.Reason.WRONG_RECOVERY_KEY,
+                            "The recovery key you typed does not match");
+                }
+            } finally {
+                typed.wipe();
+            }
+            confirmed = true;
+        }
+
+        synchronized boolean isConfirmed() {
+            return confirmed && !finished;
+        }
+
+        /** Subkey of the NEW master key, used to re-encrypt local data before the switch. */
+        synchronized byte[] deriveSubkey(String purpose) throws VaultCryptoException {
+            if (finished) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE, "Rotation already finished");
+            }
+            return VaultCrypto.deriveSubkey(newVmk, purpose);
+        }
+
+        /** Abandons the rotation; nothing was written. */
+        public synchronized void cancel() {
+            finished = true;
+            wipeSecrets();
+        }
+
+        private void wipeSecrets() {
+            VaultCrypto.wipe(newVmk);
+            VaultCrypto.wipe(kek);
+            recoveryKey.wipe();
+        }
+    }
+
+    /**
+     * Rotation step 1. Needs the unlocked, migrated vault and the password again (verified). Creates a new
+     * VMK and a new recovery key; the vault id stays and the bundle version goes up by one. Writes NOTHING.
+     * The password is not changed.
+     */
+    public synchronized Rotation beginRotation(char[] password) throws VaultCryptoException {
+        requireV2();
+        byte[] verified = unwrapStoredVmk(password);
+        boolean same = VaultCrypto.constantTimeEquals(verified, vmk);
+        VaultCrypto.wipe(verified);
+        if (!same) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Stored key differs from the unlocked key");
+        }
+        if (bundleVersion == Integer.MAX_VALUE) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE, "Bundle version exhausted");
+        }
+        byte[] newVmk = VaultCrypto.randomBytes(VaultCrypto.KEY_BYTES);
+        byte[] salt = VaultCrypto.randomBytes(VaultCrypto.SALT_BYTES);
+        RecoveryKey recoveryKey = RecoveryKey.generate();
+        byte[] kek = null;
+        boolean ok = false;
+        try {
+            kek = VaultCrypto.deriveKey(password, salt, iterations);
+            int version = bundleVersion + 1;
+            byte[] newBundle = VaultBundle.create(newVmk, vaultId, version, recoveryKey);
+            Rotation r = new Rotation(newVmk, vaultId.clone(), version, salt, kek, newBundle, recoveryKey);
+            ok = true;
+            return r;
+        } finally {
+            if (!ok) {
+                VaultCrypto.wipe(newVmk);
+                VaultCrypto.wipe(kek);
+                recoveryKey.wipe();
+            }
+        }
+    }
+
+    /**
+     * Rotation step 2, called only after the local data has been re-encrypted under the new key. Writes the
+     * new header (new VMK, new bundle), switches this manager to the new key and returns the new bundle to
+     * upload. Requires a confirmed rotation made from the current state.
+     */
+    synchronized byte[] commitRotation(Rotation r) throws VaultCryptoException {
+        requireV2();
+        synchronized (r) {
+            if (!r.isConfirmed()) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE, "The new recovery key was not confirmed");
+            }
+            if (r.bundleVersion != bundleVersion + 1 || !VaultCrypto.constantTimeEquals(r.vaultId, vaultId)) {
+                throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_STATE, "The vault changed during the rotation");
+            }
+            writeHeaderV2(r.salt, r.kek, r.newVmk, r.vaultId, r.bundleVersion, r.bundle);
+            install(r.newVmk.clone(), r.vaultId.clone(), r.bundleVersion, r.bundle.clone(), false);
+            byte[] result = r.bundle.clone();
+            r.finished = true;
+            r.wipeSecrets();
+            return result;
+        }
+    }
+
     // ------------------------------------------------------------------ restore on a new / reset device
 
     /**
@@ -388,7 +527,7 @@ public final class VaultKeyManager {
         }
     }
 
-    private static void validateNewPassword(char[] password, char[] confirmation) throws VaultCryptoException {
+    static void validateNewPassword(char[] password, char[] confirmation) throws VaultCryptoException {
         if (password == null || confirmation == null) {
             throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_ARGUMENT, "Password required");
         }

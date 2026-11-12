@@ -4,6 +4,7 @@ import android.os.SystemClock;
 
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
+import org.telegram.messenger.FileLog;
 
 import java.io.File;
 import java.io.IOException;
@@ -158,6 +159,12 @@ public final class VaultRuntime {
 
     /** Call on the UI thread right after a successful unlock. */
     public void unlocked() {
+        try {
+            // A crash in the middle of a key rotation is finished (or rolled back) before anything reads the data.
+            VaultSyncEngine.recoverRotation(store, keys, new File(dir, "sync.journal"));
+        } catch (VaultCryptoException e) {
+            FileLog.e("Vault: could not recover an interrupted key rotation: " + e.getReason());
+        }
         autoLock.onUnlocked();
         startTicking();
     }
