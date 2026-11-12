@@ -1,9 +1,11 @@
 # Build instructions
 
 ## 0. What has and has not been done
-The Android build was **not** run for this work (the authoring environment has no Android SDK/NDK and no access to
-Maven Central). The steps below follow Telegram's own instructions; whether the full app compiles with the Vault is
-**unverified**. The pure-Java parts compile and pass 420 tests (section 4).
+The authoring environment has no Android SDK, so the build is done by **GitHub Actions** (`.github/workflows/android-build.yml`):
+it runs the 420 JVM tests and builds `:TMessagesProj_App:assembleAfatDebug` (default ABI arm64-v8a; the manual run accepts other ABIs).
+On 2026-11-12 run 43193839495 compiled the whole app including the Vault and produced a 67.5 MB debug APK (artifact `telegram-vault-debug-apk`,
+path in the job `TMessagesProj_App/build/intermediates/apk/afat/debug/app.apk`). The APK was never installed or run.
+Optional repository secrets `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` replace the values in `BuildVars.java` at build time (masked in logs). The pure-Java parts compile and pass 420 tests (section 4).
 
 ## 1. Get the source
 Either clone the branch that contains the work:
@@ -27,7 +29,7 @@ git apply protected-vault-cumulative.patch
    `TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java` (`APP_ID`, `APP_HASH`). The official keys must not be reused by a fork.
 3. Create a signing config and your own Firebase `google-services.json` if you need push (the Vault itself does not).
 4. `./gradlew :TMessagesProj_App:assembleAfatDebug` (or open the project and run the `afat` / `debug` variant).
-5. If it fails to compile, the likeliest places are the Android-only files:
+5. If it fails to compile after your own changes, the Android-only files are the place to look:
    `AndroidKeystoreSecretStore.java`, `VaultRuntime.java`, `Telegram*.java`, `ui/VaultFragment.java`, `ui/VaultSender.java`,
    and the two small edits in `ChatActivity.java` / `DialogsActivity.java`. These were type-checked only against Telegram classes, never the full Android SDK.
 

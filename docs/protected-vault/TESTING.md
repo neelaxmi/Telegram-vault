@@ -31,7 +31,7 @@ reject the same failure. Method: change one line, run the suite, expect a failur
 ### What the automated tests do NOT show
 Anything involving the Android SDK, the real Keystore, real Telegram servers, real phones, the screens, or Gradle.
 `AndroidKeystoreSecretStore`, `Telegram*`, `VaultRuntime`, `VaultFragment`, `VaultSender` and the `ChatActivity`/`DialogsActivity` edits
-were not even compiled against the real Android SDK.
+compile in the full app (CI run 43193839495) but were never executed.
 
 ## 2. Manual test plan (to be run on devices; none of it has been run)
 Use at least one API 23-25 device or emulator and one recent device, and a throw-away Telegram account.
