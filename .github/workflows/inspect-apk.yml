@@ -1,0 +1,68 @@
+name: Inspect built APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run id of an "Android build" run whose telegram-vault-debug-apk artifact should be inspected'
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: telegram-vault-debug-apk
+          run-id: ${{ github.event.inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: apk
+      - name: Install build-tools
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "build-tools;36.0.0" > /dev/null
+          echo "BT=$ANDROID_HOME/build-tools/36.0.0" >> "$GITHUB_ENV"
+      - name: Integrity
+        run: |
+          cd apk; ls -l
+          sha256sum app.apk
+          stat -c 'size: %s bytes' app.apk
+          echo "--- zip test"; unzip -tq app.apk | tail -2
+          echo "--- zipalign (4-byte), and 16 KB page check for .so"
+          "$BT/zipalign" -c -v 4 app.apk | tail -3 || true
+          "$BT/zipalign" -c -P 16 -v 4 app.apk | grep -E "lib/.*\.so|Verification" | head -8 || true
+      - name: Signature
+        run: |
+          cd apk
+          "$BT/apksigner" verify --verbose --print-certs app.apk || echo "apksigner exit code $?"
+          echo "--- certificate details (jarsigner view)"
+          mkdir x && cd x && unzip -q ../app.apk 'META-INF/*' && ls -l META-INF
+          for f in META-INF/*.RSA META-INF/*.DSA META-INF/*.EC; do [ -f "$f" ] && keytool -printcert -file "$f"; done
+      - name: Manifest, package, SDK, ABI
+        run: |
+          cd apk
+          "$BT/aapt2" dump badging app.apk | grep -E "^package|sdkVersion|targetSdk|native-code|application-label:|application-debuggable|uses-permission|launchable|densities" | cut -c1-200
+          echo "--- ABIs in lib/"
+          unzip -l app.apk | awk '{print $4}' | grep '^lib/' | cut -d/ -f2 | sort | uniq -c
+          echo "--- dex files"; unzip -l app.apk | grep -E "classes[0-9]*\.dex"
+          echo "--- compression of native libs"; unzip -v app.apk 'lib/*' | head -8
+      - name: Permissions and components
+        run: |
+          cd apk
+          echo "--- permissions"; "$BT/aapt2" dump permissions app.apk
+          echo "--- requested features / exported components count"
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml app.apk > ../manifest.txt
+          grep -c "E: activity" ../manifest.txt | sed 's/^/activities: /'
+          grep -c "E: service" ../manifest.txt | sed 's/^/services: /'
+          grep -c "E: receiver" ../manifest.txt | sed 's/^/receivers: /'
+          grep -E "A: android:(debuggable|allowBackup|usesCleartextTraffic|extractNativeLibs|requestLegacyExternalStorage)" ../manifest.txt | head
+      - name: Search for remote-install and accessibility style risk indicators
+        run: |
+          cd apk
+          "$BT/aapt2" dump permissions app.apk | grep -iE "REQUEST_INSTALL_PACKAGES|BIND_ACCESSIBILITY|SYSTEM_ALERT_WINDOW|READ_SMS|RECEIVE_SMS|SEND_SMS|CALL_LOG|MANAGE_EXTERNAL_STORAGE|READ_CONTACTS|BIND_DEVICE_ADMIN|PACKAGE_USAGE" || true
