@@ -3,7 +3,7 @@ name: Inspect built APK
 on:
   push:
     branches: [protected-vault-phase1]
-    paths: ['.github/workflows/inspect-apk.yml']
+    paths: ['.github/workflows/inspect-apk.yml', '.github/inspect-run-id']
   workflow_dispatch:
     inputs:
       run_id:
@@ -20,10 +20,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Which run to inspect
+        id: rid
+        run: echo "id=${{ github.event.inputs.run_id || '' }}" >> "$GITHUB_OUTPUT"; if [ -z "${{ github.event.inputs.run_id || '' }}" ]; then echo "id=$(cat .github/inspect-run-id | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"; fi
       - uses: actions/download-artifact@v4
         with:
           name: telegram-vault-debug-apk
-          run-id: ${{ github.event.inputs.run_id || '43193839495' }}
+          run-id: ${{ steps.rid.outputs.id }}
           github-token: ${{ github.token }}
           path: apk
       - name: Install build-tools

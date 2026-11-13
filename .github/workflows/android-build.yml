@@ -7,6 +7,7 @@ on:
       - 'docs/**'
       - '**/*.md'
       - '.github/workflows/inspect-apk.yml'
+      - '.github/inspect-run-id'
   workflow_dispatch:
     inputs:
       abis:
