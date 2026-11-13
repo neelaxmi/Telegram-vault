@@ -4,7 +4,7 @@ A password-protected, end-to-end encrypted "Saved Messages"-like space added to 
 source (DrKLO/Telegram 13.1.1, base commit `3de37c8`).
 
 > **Status, stated plainly.** The cryptography, storage, sync, device-linking, key-rotation and access-control
-> logic is plain Java and is covered by 420 automated JVM tests, all passing. **The full Android app now compiles:
+> logic is plain Java and is covered by 447 automated JVM tests, all passing. **The full Android app now compiles:
 > GitHub Actions built a debug APK (`.github/workflows/android-build.yml`, arm64-v8a only). It has never been installed or run, and
 > nothing has been tested against real Telegram servers.** The Android screens and the Telegram glue are therefore compiled but unexercised. Treat everything on the Android side
 > as unverified until the manual checks in [TESTING.md](TESTING.md) have been done on a device.
@@ -17,7 +17,7 @@ source (DrKLO/Telegram 13.1.1, base commit `3de37c8`).
   with a clear message.
 - **Vault screen** like Saved Messages: write notes, add files and photos, search, multi-select and delete, open
   photos, export files.
-- **Password** (12+ characters, typed twice) and a **mandatory recovery key** (256 bits, 54 characters + 2 check
+- **Password** (6+ characters, typed twice) and a **mandatory 12-word recovery phrase** (BIP-39, 128 bits; legacy 256-bit keys of older vaults still work; was 54 characters + 2 check
   characters) that must be typed back before the Vault exists.
 - **Failed attempts** are counted (saved *before* the password is checked) and shown after the next successful unlock.
   An optional switch deletes **this device's** Vault data after 5 wrong passwords; it never touches the server or other devices.

@@ -56,7 +56,7 @@ public class UiLogicTest {
         f.submitPassword(PW.toCharArray(), PW.toCharArray());
         assertEquals(SetupFlow.Step.SHOW_KEY, f.step());
         String key = f.recoveryKeyText();
-        assertEquals(54 + 8, key.length());
+        assertEquals(12, key.split(" ").length); // 12-word recovery phrase
         f.keyWrittenDown();
         assertFalse(hs.exists());
         assertFalse(keys.isUnlocked());

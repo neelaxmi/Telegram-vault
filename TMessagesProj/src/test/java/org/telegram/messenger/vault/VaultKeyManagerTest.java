@@ -93,11 +93,11 @@ public class VaultKeyManagerTest {
 
     @Test
     public void create_lengthIsCountedInCharactersNotUtf16Units() throws Exception {
-        // 11 emoji = 22 UTF-16 units but only 11 characters: must be rejected.
-        String sevenEmoji = rep(new String(Character.toChars(0x1F600)), 11);
+        // 5 emoji = 10 UTF-16 units but only 5 characters: must be rejected (minimum is 6 characters).
+        String sevenEmoji = rep(new String(Character.toChars(0x1F600)), 5);
         assertReason(VaultCryptoException.Reason.INVALID_ARGUMENT,
                 () -> manager.createVault(pw(sevenEmoji), pw(sevenEmoji)));
-        String eightEmoji = rep(new String(Character.toChars(0x1F600)), 12);
+        String eightEmoji = rep(new String(Character.toChars(0x1F600)), 6);
         manager.createVault(pw(eightEmoji), pw(eightEmoji));
         assertTrue(manager.isUnlocked());
     }

@@ -142,14 +142,14 @@ public class VaultKeyManagerV2Test {
     }
 
     @Test
-    public void beginSetup_enforcesTwelveCharactersAndConfirmation() {
-        for (String shortPw : new String[]{"", "short", "elevenchars", "12345678901"}) {
+    public void beginSetup_enforcesSixCharactersAndConfirmation() {
+        for (String shortPw : new String[]{"", "a", "short", "12345"}) {
             assertReason(VaultCryptoException.Reason.INVALID_ARGUMENT, () -> manager.beginSetup(pw(shortPw), pw(shortPw)));
         }
         assertReason(VaultCryptoException.Reason.INVALID_ARGUMENT, () -> manager.beginSetup(pw(PASSWORD), pw(PASSWORD + "x")));
         assertReason(VaultCryptoException.Reason.INVALID_ARGUMENT, () -> manager.beginSetup(null, pw(PASSWORD)));
         assertFalse(manager.isInitialized());
-        assertEquals(12, VaultKeyManager.MIN_PASSWORD_LENGTH);
+        assertEquals(6, VaultKeyManager.MIN_PASSWORD_LENGTH);
     }
 
     @Test

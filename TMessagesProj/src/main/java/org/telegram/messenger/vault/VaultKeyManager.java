@@ -40,7 +40,7 @@ import java.util.Arrays;
 public final class VaultKeyManager {
 
     /** Minimum length, in Unicode characters, enforced when a password is created or changed (decision 7). */
-    public static final int MIN_PASSWORD_LENGTH = 12;
+    public static final int MIN_PASSWORD_LENGTH = 6;
     /** Maximum accepted password length; bounds the work done per attempt. */
     public static final int MAX_PASSWORD_LENGTH = 256;
 

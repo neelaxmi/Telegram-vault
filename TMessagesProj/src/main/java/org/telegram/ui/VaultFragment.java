@@ -29,6 +29,7 @@ import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.vault.LinkTransport;
 import org.telegram.messenger.vault.RemoteBundle;
 import org.telegram.messenger.vault.SetupFlow;
+import org.telegram.messenger.vault.SetupSession;
 import org.telegram.messenger.vault.SyncCoordinator;
 import org.telegram.messenger.vault.VaultAccess;
 import org.telegram.messenger.vault.VaultCryptoException;
@@ -65,7 +66,8 @@ public class VaultFragment extends BaseFragment {
 
     private VaultRuntime rt;
     private FrameLayout container;
-    private SetupFlow flow;
+    /** Owns the set-up flow; the UI never keeps its own reference (a stale one caused a crash after a pause). */
+    private SetupSession session;
     private byte[] restoreBundle;
     private boolean restoreMode;
     private VaultListModel model;
@@ -82,6 +84,12 @@ public class VaultFragment extends BaseFragment {
     @Override
     public boolean onFragmentCreate() {
         rt = VaultRuntime.get(UserConfig.selectedAccount);
+        session = new SetupSession(rt.keys, new SetupSession.Clock() {
+            @Override
+            public long nowMillis() {
+                return android.os.SystemClock.elapsedRealtime();
+            }
+        }, SetupSession.DEFAULT_GRACE_MILLIS);
         rt.setOnLockedUi(new Runnable() {
             @Override
             public void run() {
@@ -97,9 +105,7 @@ public class VaultFragment extends BaseFragment {
     @Override
     public void onFragmentDestroy() {
         destroyed = true;
-        if (flow != null) {
-            flow.cancel();
-        }
+        session.cancel();
         if (rotationPlan != null) {
             rotationPlan.cancel();
             rotationPlan = null;
@@ -150,7 +156,21 @@ public class VaultFragment extends BaseFragment {
             a.getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
         }
         rt.autoLock.onForeground(); // locks first if the time away was too long
-        if (container != null && !rt.keys.isUnlocked() && flow == null && !restoreMode && model != null) {
+        if (container == null) {
+            return;
+        }
+        AndroidUtilities.cancelRunOnUIThread(expireSetup);
+        switch (session.onResume()) {
+            case CONTINUE:
+                renderSetupStep(); // the views were removed in onPause; draw the current step again
+                return;
+            case EXPIRED:
+                setupInterrupted();
+                return;
+            default:
+                break;
+        }
+        if (!rt.keys.isUnlocked() && !restoreMode && model != null) {
             decide();
         }
     }
@@ -160,9 +180,13 @@ public class VaultFragment extends BaseFragment {
         super.onPause();
         // FLAG_SECURE stays on while this screen exists, including while the app is in the background, so the
         // Recents thumbnail is blank. It is cleared in onFragmentDestroy.
-        if (flow != null) {
-            flow.cancel(); // never leave the recovery key on screen while away
-            flow = null;
+        if (session.isActive()) {
+            // Never leave the recovery phrase on screen while away. The setup itself stays valid for a short
+            // time (SetupSession); onResume draws the current step again, or starts over after the grace time.
+            session.onPause();
+            container.removeAllViews();
+            AndroidUtilities.cancelRunOnUIThread(expireSetup);
+            AndroidUtilities.runOnUIThread(expireSetup, session.graceMillis() + 1000);
         }
         if (!launching) {
             rt.autoLock.onBackground();
@@ -170,6 +194,46 @@ public class VaultFragment extends BaseFragment {
     }
 
     // ------------------------------------------------------------------ routing
+
+    /** Wipes an abandoned setup once the grace time ran out, even if the user has not come back yet. */
+    private final Runnable expireSetup = new Runnable() {
+        @Override
+        public void run() {
+            if (session != null) {
+                session.expireIfPaused();
+            }
+        }
+    };
+
+    /** Draws the step the live setup is on. Falls back to a fresh start if there is none. */
+    private void renderSetupStep() {
+        try {
+            SetupFlow f = session.flow();
+            switch (f.step()) {
+                case SHOW_KEY:
+                    showRecoveryKey(session.isMigration());
+                    return;
+                case CONFIRM_KEY:
+                    showConfirmKey(session.isMigration());
+                    return;
+                default:
+                    showSetupPassword(session.isMigration());
+                    return;
+            }
+        } catch (VaultCryptoException e) {
+            setupInterrupted();
+        }
+    }
+
+    /** The setup is gone (time away, lock, or an earlier error): say so and start again with a NEW phrase. */
+    private void setupInterrupted() {
+        session.cancel();
+        decide();
+        Activity a = getParentActivity();
+        if (a != null) {
+            android.widget.Toast.makeText(a, "Setup was interrupted. Nothing was saved. Start again; you will get a new recovery phrase.", android.widget.Toast.LENGTH_LONG).show();
+        }
+    }
 
     private void decide() {
         if (rt.keys.isUnlocked()) {
@@ -187,10 +251,7 @@ public class VaultFragment extends BaseFragment {
 
     /** Drops anything secret from the views (called when the Vault locks). */
     private void leaveSecrets() {
-        if (flow != null) {
-            flow.cancel();
-            flow = null;
-        }
+        session.cancel();
         restoreBundle = null;
         if (rotationPlan != null) {
             rotationPlan.cancel();
@@ -329,17 +390,17 @@ public class VaultFragment extends BaseFragment {
 
     private void showSetupPassword(final boolean migrate) {
         final Context c = container.getContext();
-        flow = new SetupFlow(rt.keys);
+        session.start(migrate);
         LinearLayout p = page(c);
         p.addView(text(c, migrate ? "Upgrade your Vault" : "Create your Protected Vault", 22, true));
         p.addView(text(c, migrate
-                ? "Your Vault will be upgraded so it can sync between your devices. Your items stay as they are. Choose a new password (at least 12 characters); you will then get a recovery key."
-                : "Your Vault is encrypted on this device and stored encrypted in a private channel of your Telegram account, so you can use it on several devices. Choose a password for THIS device (at least 12 characters). Next you will get a recovery key; it is the only way back in if you lose this phone.", 15, false));
+                ? "Your Vault will be upgraded so it can sync between your devices. Your items stay as they are. Choose a new password (at least 6 characters); you will then get a recovery key."
+                : "Your Vault is encrypted on this device and stored encrypted in a private channel of your Telegram account, so you can use it on several devices. Choose a password for THIS device (at least 6 characters). Next you will get a recovery key; it is the only way back in if you lose this phone.", 15, false));
         final EditText oldPw = migrate ? field(c, "Current Vault password", true) : null;
         if (oldPw != null) {
             p.addView(oldPw);
         }
-        final EditText pw = field(c, "Password (12+ characters)", true);
+        final EditText pw = field(c, "Password (6+ characters)", true);
         final EditText pw2 = field(c, "Repeat password", true);
         final TextView err = text(c, "", 14, false);
         err.setTextColor(Theme.getColor(Theme.key_text_RedRegular));
@@ -351,13 +412,17 @@ public class VaultFragment extends BaseFragment {
             public void onClick(View v) {
                 try {
                     if (migrate) {
-                        flow.submitMigration(chars(oldPw), chars(pw), chars(pw2));
+                        session.flow().submitMigration(chars(oldPw), chars(pw), chars(pw2));
                     } else {
-                        flow.submitPassword(chars(pw), chars(pw2));
+                        session.flow().submitPassword(chars(pw), chars(pw2));
                     }
                     showRecoveryKey(migrate);
                 } catch (VaultCryptoException e) {
-                    err.setText(messageFor(e));
+                    if (e.getReason() == VaultCryptoException.Reason.INVALID_STATE && !session.isActive()) {
+                        setupInterrupted();
+                    } else {
+                        err.setText(messageFor(e));
+                    }
                 }
             }
         }));
@@ -378,6 +443,19 @@ public class VaultFragment extends BaseFragment {
         show(p);
     }
 
+    /** "one two ..." -> "1. one  2. two ..." for a 12-word phrase; anything else unchanged. */
+    private static String numbered(String key) {
+        String[] w = key.split(" ");
+        if (w.length != 12) {
+            return key;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < w.length; i++) {
+            sb.append(i + 1).append(". ").append(w[i]).append(i % 2 == 1 ? "\n" : "      ");
+        }
+        return sb.toString().trim();
+    }
+
     private static char[] chars(EditText e) {
         return e.getText().toString().toCharArray();
     }
@@ -385,10 +463,10 @@ public class VaultFragment extends BaseFragment {
     private void showRecoveryKey(final boolean migrate) {
         final Context c = container.getContext();
         LinearLayout p = page(c);
-        p.addView(text(c, "Your recovery key", 22, true));
-        p.addView(text(c, "Write this down on paper and keep it somewhere safe. It is shown only now. Without it, a lost phone means a lost Vault. Anyone with this key and access to your Telegram account's Vault channel could open your Vault, so do not photograph it or save it in a chat.", 15, false));
+        p.addView(text(c, "Your 12-word recovery phrase", 22, true));
+        p.addView(text(c, "Write these 12 words down on paper, in order, and keep them somewhere safe. They are shown only now. Without it, a lost phone means a lost Vault. Anyone with this key and access to your Telegram account's Vault channel could open your Vault, so do not photograph it or save it in a chat.", 15, false));
         try {
-            TextView key = text(c, flow.recoveryKeyText(), 18, true);
+            TextView key = text(c, numbered(session.flow().recoveryKeyText()), 18, true);
             key.setTypeface(Typeface.MONOSPACE);
             key.setTextIsSelectable(false);
             p.addView(key);
@@ -399,10 +477,10 @@ public class VaultFragment extends BaseFragment {
             @Override
             public void onClick(View v) {
                 try {
-                    flow.keyWrittenDown();
+                    session.flow().keyWrittenDown();
                     showConfirmKey(migrate);
                 } catch (VaultCryptoException e) {
-                    decide();
+                    setupInterrupted();
                 }
             }
         }));
@@ -412,8 +490,8 @@ public class VaultFragment extends BaseFragment {
     private void showConfirmKey(final boolean migrate) {
         final Context c = container.getContext();
         LinearLayout p = page(c);
-        p.addView(text(c, "Confirm your recovery key", 22, true));
-        p.addView(text(c, "Type the recovery key from your paper to prove you have it. The Vault is created only after this matches.", 15, false));
+        p.addView(text(c, "Confirm your recovery phrase", 22, true));
+        p.addView(text(c, "Type the 12 words from your paper (separated by spaces) to prove you have them. The Vault is created only after this matches.", 15, false));
         final EditText key = field(c, "Recovery key", false);
         final TextView err = text(c, "", 14, false);
         err.setTextColor(Theme.getColor(Theme.key_text_RedRegular));
@@ -424,13 +502,17 @@ public class VaultFragment extends BaseFragment {
             public void onClick(final View v) {
                 final String typed = key.getText().toString();
                 try {
-                    final byte[] bundle = flow.confirm(typed);
-                    flow = null;
+                    session.flow().confirm(typed);
+                    session.cancel(); // finished: drop the (completed) flow
                     rt.unlocked();
                     uploadFirstBundle();
                     showList();
                 } catch (VaultCryptoException e) {
-                    err.setText(messageFor(e));
+                    if (e.getReason() == VaultCryptoException.Reason.INVALID_STATE) {
+                        setupInterrupted(); // the setup is gone: never crash, start again
+                    } else {
+                        err.setText(messageFor(e));
+                    }
                 }
             }
         }));
@@ -438,10 +520,10 @@ public class VaultFragment extends BaseFragment {
             @Override
             public void onClick(View v) {
                 try {
-                    flow.backToKey();
+                    session.flow().backToKey();
                     showRecoveryKey(migrate);
                 } catch (VaultCryptoException e) {
-                    decide();
+                    setupInterrupted();
                 }
             }
         }));
@@ -490,7 +572,7 @@ public class VaultFragment extends BaseFragment {
         final Context c = container.getContext();
         LinearLayout p = page(c);
         p.addView(text(c, "Restore your Vault", 22, true));
-        p.addView(text(c, "Enter your recovery key and choose a password for this device (12+ characters).", 15, false));
+        p.addView(text(c, "Enter your recovery key and choose a password for this device (6+ characters).", 15, false));
         final EditText key = field(c, "Recovery key", false);
         final EditText pw = field(c, "New password", true);
         final EditText pw2 = field(c, "Repeat password", true);
@@ -1149,8 +1231,8 @@ public class VaultFragment extends BaseFragment {
         final Context c = container.getContext();
         LinearLayout p = page(c);
         p.addView(text(c, "Link this phone", 22, true));
-        p.addView(text(c, "Choose a password for THIS phone (12+ characters). Then open the Vault on your other phone, go to Settings, and choose \"Link a new device\" first. Start here after that.", 15, false));
-        final EditText pw = field(c, "Password (12+ characters)", true);
+        p.addView(text(c, "Choose a password for THIS phone (6+ characters). Then open the Vault on your other phone, go to Settings, and choose \"Link a new device\" first. Start here after that.", 15, false));
+        final EditText pw = field(c, "Password (6+ characters)", true);
         final EditText pw2 = field(c, "Repeat password", true);
         final TextView status = text(c, "", 15, false);
         p.addView(pw);
@@ -1161,8 +1243,8 @@ public class VaultFragment extends BaseFragment {
             public void onClick(View v) {
                 final char[] a1 = chars(pw);
                 final char[] a2 = chars(pw2);
-                if (a1.length < 12 || !java.util.Arrays.equals(a1, a2)) {
-                    status.setText("The password needs at least 12 characters and both entries must match.");
+                if (a1.length < org.telegram.messenger.vault.VaultKeyManager.MIN_PASSWORD_LENGTH || !java.util.Arrays.equals(a1, a2)) {
+                    status.setText("The password needs at least 6 characters and both entries must match.");
                     return;
                 }
                 status.setText("Contacting your other phone\u2026");
@@ -1323,7 +1405,7 @@ public class VaultFragment extends BaseFragment {
         final Context c = container.getContext();
         LinearLayout p = page(c);
         p.addView(text(c, "Restore after a key rotation", 22, true));
-        p.addView(text(c, "The keys of this Vault were rotated on another device. Enter the NEW recovery key and choose a password for this phone (12+ characters). This phone's local copy is replaced by a fresh download; anything saved here that had not synced is lost.", 15, false));
+        p.addView(text(c, "The keys of this Vault were rotated on another device. Enter the NEW recovery key and choose a password for this phone (6+ characters). This phone's local copy is replaced by a fresh download; anything saved here that had not synced is lost.", 15, false));
         final EditText key = field(c, "New recovery key", false);
         final EditText pw = field(c, "New password", true);
         final EditText pw2 = field(c, "Repeat password", true);

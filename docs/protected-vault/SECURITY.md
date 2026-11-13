@@ -28,11 +28,11 @@ not tested against Telegram's servers.** Do not rely on it for anything that mat
 
 ## Cryptographic design
 - **Master key (VMK)**: 32 random bytes per account. HKDF-SHA256 derives separate subkeys: `messages`, `media`, `bundle-auth`, `journal`, `dedup`, `object-names`.
-- **Password**: NFKC-normalised, 12+ characters. PBKDF2-HMAC-SHA256, 600,000 iterations (own implementation for API 23), random 16-byte salt per device. Result = KEK.
+- **Password**: NFKC-normalised, 6+ characters (the user asked for 6; a short password is weaker against guessing, mitigated by the Keystore-wrapped header, PBKDF2 600k and the five-failure wipe; no password-derived slot exists on the server). PBKDF2-HMAC-SHA256, 600,000 iterations (own implementation for API 23), random 16-byte salt per device. Result = KEK.
 - **Per-device header ("TGVH" v2)**: VMK wrapped under the KEK, then wrapped again by the non-exportable Android Keystore key. No password hash exists; a wrong password is a failed AES-GCM unwrap.
 - **Records and media**: AES-256-GCM. Records are padded and bound to their id; media uses 64 KiB chunks with a per-file key, chunk counter + final flag in the nonce (reordering, truncation and extension are detected) and the media id as associated data.
 - **Key bundle ("TGVB")**: VMK sealed under a key derived from the 256-bit recovery key, HMAC-authenticated, versioned. A device that sees an older bundle than it has treats it as a rollback and stops.
-- **Recovery key**: 256 random bits, Crockford base32, check characters; must be typed back at creation.
+- **Recovery phrase**: 12 BIP-39 words = 128 random bits (4-bit checksum), expanded with HKDF-SHA256 to the 256-bit slot key; must be typed back at creation. Legacy 256-bit Crockford keys (54 chars) are still accepted for existing vaults.
 - **Device linking**: ECDH (P-256) with commit-then-reveal so neither side can pick its key after seeing the other's; both screens show a 6-digit code derived from the whole transcript; the user must confirm they match. Session lasts 5 minutes; a mismatch cancels it for good. The grant (VMK + bundle) is encrypted under the session key.
 - **Sync objects** are one Telegram channel message each, caption `tgv1 <name>`; data is only ever accepted if it authenticates under the VMK. Server content is never trusted; foreign messages are ignored.
 - **Access control**: the attempt counter is stored (device-wrapped) *before* the password is verified so killing the app cannot reset it; a damaged counter becomes a cautious state (limit minus one). The wipe switch can be changed only while unlocked, is off by default, and deletes only local data. Auto-lock uses `elapsedRealtime`; a clock that goes backwards locks.

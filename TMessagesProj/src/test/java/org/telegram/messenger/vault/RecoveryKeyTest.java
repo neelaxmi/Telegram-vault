@@ -55,7 +55,7 @@ public class RecoveryKeyTest {
 
     @Test
     public void format_shapeIsNineGroupsOfSixFromTheCrockfordAlphabet() {
-        String text = RecoveryKey.generate().format();
+        String text = RecoveryKey.generateLegacy().format(); // legacy 54-character format stays supported
         assertEquals(54 + 8, text.length());
         String[] groups = text.split("-");
         assertEquals(9, groups.length);

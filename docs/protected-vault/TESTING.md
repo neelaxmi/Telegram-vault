@@ -1,7 +1,7 @@
 # Testing
 
-## 1. Automated tests: 420 passing (plain JVM, Java 21, JUnit 4.13.2)
-Run with `docs/protected-vault/tools/run-vault-tests.sh` (see BUILD_INSTRUCTIONS.md). Last result: `OK (420 tests)`, repeated runs stable.
+## 1. Automated tests: 447 passing (plain JVM, Java 21, JUnit 4.13.2)
+Run with `docs/protected-vault/tools/run-vault-tests.sh` (see BUILD_INSTRUCTIONS.md). Last result: `OK (447 tests)`, repeated runs stable.
 
 | Test class | Tests | Covers |
 |---|---|---|
@@ -38,7 +38,7 @@ Use at least one API 23-25 device or emulator and one recent device, and a throw
 
 **Setup and access**
 1. Menu shows "Protected Vault 🔐" directly below Saved Messages.
-2. Create a Vault: password < 12 chars refused; mismatched confirmation refused; recovery key shown; wrong typed key refused; correct key creates the Vault.
+2. Create a Vault: password < 6 chars refused; mismatched confirmation refused; recovery key shown; wrong typed key refused; correct key creates the Vault.
 3. Kill the app, reopen, unlock. Wrong password shows an error; after a successful unlock the failed-attempt count is shown once.
 4. Enable "delete after 5 wrong passwords"; five wrong passwords wipe this phone only; the server and other devices keep data; restore with the recovery key works.
 5. Auto-lock: leave the app (locks), wait for the inactivity time, manual lock. Restart the app: the chosen settings are still there.
@@ -65,3 +65,6 @@ refusal in a protected chat; unlock with failed-attempt report; settings; link-d
 
 ## 4. Demo video script (about 4 minutes)
 1. Chat list: point to the menu entry below Saved Messages. 2. Create the Vault, show and confirm the recovery key. 3. Add a note and a photo. 4. Long-press a chat message: Send to Vault; show the protected-chat refusal. 5. Lock via leaving the app; Recents is blank; unlock. 6. Link a second phone: show the matching codes. 7. Delete an item on one phone and show it vanish on the other. 8. Rotate keys; show the second phone asking for the new key. 9. Five wrong passwords with the wipe switch on (this phone only). Record with the phone's screen recorder; FLAG_SECURE blocks recording of the Vault screens on some devices, so for the demo temporarily build with the flag disabled.
+
+## Setup lifecycle fix (13 Nov 2026)
+Device log showed `NullPointerException ... SetupFlow.confirm()` at `VaultFragment$10.onClick`: `onPause()` cancelled the flow and set the field to null, but the recovery/confirm screens stayed on display, so the next tap ran on null. Fix: `SetupSession` owns the flow (never null: INVALID_STATE instead), keeps it for a 5-minute grace period while the app is away, the UI hides the phrase while paused and redraws the current step on return, and an expired setup restarts with a NEW phrase (nothing is written before confirmation). Regression tests: `SetupSessionTest` (13), `RecoveryPhraseTest` (14). **Not verified on a device** until the new APK is tried: pause the app on the confirm screen, return, confirm.

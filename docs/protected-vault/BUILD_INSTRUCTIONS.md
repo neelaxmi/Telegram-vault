@@ -2,10 +2,10 @@
 
 ## 0. What has and has not been done
 The authoring environment has no Android SDK, so the build is done by **GitHub Actions** (`.github/workflows/android-build.yml`):
-it runs the 420 JVM tests and builds `:TMessagesProj_App:assembleAfatDebug` (default ABI arm64-v8a; the manual run accepts other ABIs).
+it runs the 447 JVM tests and builds `:TMessagesProj_App:assembleAfatDebug` (default ABI arm64-v8a; the manual run accepts other ABIs).
 On 2026-11-12 run 43193839495 compiled the whole app including the Vault and produced a 67.5 MB debug APK (artifact `telegram-vault-debug-apk`,
 path in the job `TMessagesProj_App/build/intermediates/apk/afat/debug/app.apk`). The APK was never installed or run.
-Optional repository secrets `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` replace the values in `BuildVars.java` at build time (masked in logs). The pure-Java parts compile and pass 420 tests (section 4).
+Optional repository secrets `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` replace the values in `BuildVars.java` at build time (masked in logs). The pure-Java parts compile and pass 447 tests (section 4).
 
 ## 1. Get the source
 Either clone the branch that contains the work:
@@ -49,7 +49,7 @@ Java 8 or newer, plus two jars from Maven Central (`junit-4.13.2.jar`, `hamcrest
 ```
 JUNIT_DIR=/path/to/jars docs/protected-vault/tools/run-vault-tests.sh
 ```
-Expected last line: `OK (420 tests)`. The run takes well under a minute. Through Gradle the same tests are in
+Expected last line: `OK (447 tests)`. The run takes well under a minute. Through Gradle the same tests are in
 `TMessagesProj/src/test`, but `./gradlew :TMessagesProj:testDebugUnitTest` has **not** been run.
 
 ## 5. Measure PBKDF2 on a phone (decision 5)
