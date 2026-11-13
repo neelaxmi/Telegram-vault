@@ -120,6 +120,24 @@ jobs:
             echo "::error::APK is marked testOnly and cannot be installed normally"; exit 1
           fi
 
+      - name: Verify APK (identity, signature, ABI, integrity)
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          apk=$(find . -name 'app.apk' -path '*debug*' -not -path './.gradle/*' | head -n 1)
+          sha256sum "$apk"
+          unzip -tq "$apk"
+          "$BT/zipalign" -c -P 16 4 "$apk" && echo "zipalign OK" || "$BT/zipalign" -c 4 "$apk"
+          "$BT/apksigner" verify --verbose --print-certs "$apk" | tee "$RUNNER_TEMP/sign.txt"
+          grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" "$RUNNER_TEMP/sign.txt"
+          "$BT/aapt2" dump badging "$apk" > "$RUNNER_TEMP/badging.txt"
+          grep -E "^package:|^sdkVersion|^targetSdkVersion|^native-code|^application-label:" "$RUNNER_TEMP/badging.txt"
+          grep -q "name='app.protectedvault.debug'" "$RUNNER_TEMP/badging.txt" || { echo "::error::unexpected package id"; exit 1; }
+          grep -q "^native-code:.*arm64-v8a" "$RUNNER_TEMP/badging.txt" || { echo "::error::no arm64-v8a code"; exit 1; }
+          if grep -q "Signer #1 certificate DN: CN=Android Developer" "$RUNNER_TEMP/sign.txt"; then
+            echo "::error::APK is signed with the public upstream Telegram key"; exit 1
+          fi
+          case "$apk" in *.aab) echo "::error::AAB"; exit 1;; esac
+
       - name: Locate APK
         id: apk
         run: |
