@@ -2718,6 +2718,16 @@ public class ChatActivity extends BaseFragment implements
     @Override
     public boolean onFragmentCreate() {
         final long chatId = arguments.getLong("chat_id", 0);
+        if (org.telegram.messenger.vault.TelegramVaultChannel.isVaultChannel(currentAccount, chatId)) {
+            // The Vault's storage channel holds only encrypted blobs and must not open as an ordinary channel chat.
+            AndroidUtilities.runOnUIThread(() -> {
+                BaseFragment last = LaunchActivity.getSafeLastFragment();
+                if (last != null && !(last instanceof VaultFragment)) {
+                    last.presentFragment(new VaultFragment());
+                }
+            });
+            return false;
+        }
         final long userId = arguments.getLong("user_id", 0);
         final int encId = arguments.getInt("enc_id", 0);
         dialogFolderId = arguments.getInt("dialog_folder_id", 0);

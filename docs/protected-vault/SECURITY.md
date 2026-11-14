@@ -46,3 +46,14 @@ not tested against Telegram's servers.** Do not rely on it for anything that mat
 5. Media sizes on the server are visible; the 2000 MB upload limit is enforced locally.
 6. Rotation downloads every item first and needs time and network proportional to the Vault size; interrupting is safe (rolled back or completed on next unlock) but unverified on real hardware.
 7. The Recents/screenshot protection, backup exclusion and Keystore behaviour depend on Android behaviour that was not exercised.
+
+## Saving while locked: the sealed inbox (14 Nov 2026)
+"Send to Vault" works with the Vault locked and needs neither the password nor the master key (VMK) in memory.
+- The Vault has an EC P-256 inbox key pair. The **public** key is stored wrapped by the Android Keystore device key (readable while locked; a file-only attacker cannot substitute their own). The **private** key is stored encrypted under an HKDF subkey of the VMK (`inbox-private`), so it exists in clear only while unlocked.
+- A message saved while locked is sealed with ECIES: ephemeral ECDH P-256, HKDF-SHA256 (salt = ephemeral and recipient keys), AES-256-GCM, AAD = magic, version, ephemeral key and the envelope id. Media is encrypted in 64 KiB AEAD chunks with a random content key kept inside the envelope. No plaintext text, file name, MIME type or media is written.
+- At the next unlock the envelopes are opened, added to the normal encrypted store (and synced), and overwritten/deleted only after the store accepted them. Media is decrypted through a pipe straight into the store: no plaintext copy touches the disk.
+- Limits: (1) the key pair is created at the first unlock after creating or upgrading a vault, so a vault that has never been unlocked since this change cannot take messages while locked (the user is told); (2) pending envelopes reveal their size and time; (3) after a key rotation adopted from another device the private key is re-created, and envelopes sealed to the old key cannot be opened (they are kept as `.bad`, never deleted); (4) the five-failure wipe deletes the inbox too.
+- Not changed: PBKDF2 600k, header, recovery phrase, bundle, rotation.
+
+## Vault storage channel
+The cloud copy of the Vault is a private Telegram channel holding only encrypted blobs; local storage is the encrypted VaultStore. The channel cannot be opened as an ordinary chat inside this app any more (ChatActivity redirects to the Vault screen); it still exists on the server and is visible, muted, in the chat list and on other Telegram clients as a channel of opaque files.

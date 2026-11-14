@@ -36,6 +36,12 @@ public final class VaultRuntime {
     private final File dir;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final ExecutorService linkIo = Executors.newSingleThreadExecutor();
+    /** Unlock and "save while locked" get their own threads so they never wait behind a long network sync on {@link #io()}. */
+    private final ExecutorService unlockIo = Executors.newSingleThreadExecutor();
+    private final ExecutorService inboxIo = Executors.newSingleThreadExecutor();
+    /** Write-only ingestion for messages saved while the Vault is locked (see {@link VaultInbox}). */
+    public final VaultInbox inbox;
+    private volatile Runnable onInboxDrained;
     private volatile VaultSyncEngine engine;
     private volatile VaultRemoteStore remote;
     private volatile SyncCoordinator.Listener uiListener;
@@ -62,8 +68,9 @@ public final class VaultRuntime {
                 new AndroidKeystoreSecretStore(AndroidKeystoreSecretStore.DEFAULT_ALIAS + "_" + account));
         keys = new VaultKeyManager(new FileVaultHeaderStore(new File(dir, "header.bin")), wrapper);
         store = new VaultStore(new File(dir, "data"), keys);
+        inbox = new VaultInbox(new File(dir, "inbox"), wrapper);
         access = new VaultAccess(keys, new FileVaultHeaderStore(new File(dir, "attempts.bin")), wrapper,
-                VaultAccess.localWipe(keys, store), new VaultStore.Clock() {
+                VaultAccess.localWipe(keys, store, inbox), new VaultStore.Clock() {
                     @Override
                     public long nowMillis() {
                         return System.currentTimeMillis();
@@ -104,6 +111,19 @@ public final class VaultRuntime {
                 .putBoolean("lock_on_background", autoLock.isLockOnBackground())
                 .putLong("inactivity_millis", autoLock.getInactivityMillis())
                 .apply();
+    }
+
+    public ExecutorService unlockIo() {
+        return unlockIo;
+    }
+
+    public ExecutorService inboxIo() {
+        return inboxIo;
+    }
+
+    /** Called on the UI thread when items saved while locked have been moved into the open Vault. */
+    public void setOnInboxDrained(Runnable r) {
+        onInboxDrained = r;
     }
 
     public ExecutorService io() {
@@ -193,6 +213,32 @@ public final class VaultRuntime {
         }
         autoLock.onUnlocked();
         startTicking();
+        // Items saved while locked wait in the sealed inbox; move them into the Vault now (off the UI thread).
+        unlockIo.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    inbox.ensureKeyPair(keys); // new and upgraded vaults get their inbox key at the first unlock
+                    VaultInbox.DrainReport r = inbox.drain(keys, store);
+                    if (r.failed > 0) {
+                        FileLog.e("Vault: " + r.failed + " inbox item(s) could not be opened and were kept aside");
+                    }
+                    if (r.moved > 0) {
+                        FileLog.d("Vault: moved " + r.moved + " inbox item(s) into the Vault");
+                        SyncCoordinator c = coordinator();
+                        if (c != null) {
+                            c.requestSync(false); // otherwise the next sync picks the new items up
+                        }
+                        final Runnable cb = onInboxDrained;
+                        if (cb != null) {
+                            AndroidUtilities.runOnUIThread(cb);
+                        }
+                    }
+                } catch (VaultCryptoException e) {
+                    FileLog.e("Vault: inbox step failed: " + e.getReason());
+                }
+            }
+        });
     }
 
     private void startTicking() {

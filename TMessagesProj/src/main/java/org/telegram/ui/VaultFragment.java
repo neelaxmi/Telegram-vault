@@ -25,6 +25,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.FileLog;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.vault.LinkTransport;
 import org.telegram.messenger.vault.RemoteBundle;
@@ -99,6 +100,14 @@ public class VaultFragment extends BaseFragment {
                 }
             }
         });
+        rt.setOnInboxDrained(new Runnable() {
+            @Override
+            public void run() {
+                if (!destroyed && model != null && searchField != null) {
+                    reload(searchField.getText().toString()); // items saved while locked just arrived
+                }
+            }
+        });
         return super.onFragmentCreate();
     }
 
@@ -115,6 +124,7 @@ public class VaultFragment extends BaseFragment {
             act.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE); // other Telegram screens are not secured
         }
         rt.setOnLockedUi(null);
+        rt.setOnInboxDrained(null);
         super.onFragmentDestroy();
     }
 
@@ -602,29 +612,200 @@ public class VaultFragment extends BaseFragment {
 
     // ------------------------------------------------------------------ unlock
 
+    /**
+     * The password wall. While locked nothing is decrypted, so there is no real chat to blur: behind the card is a
+     * decoy of generic, empty bubbles (a fixed number, so it reveals nothing about how many messages exist), blurred
+     * on Android 12+ and dimmed everywhere. The wall swallows every touch so nothing behind it can be used.
+     */
     private void showUnlock(String message) {
         final Context c = container.getContext();
-        LinearLayout p = page(c);
-        p.addView(text(c, "Protected Vault", 22, true));
-        final EditText pw = field(c, "Password", true);
-        final TextView err = text(c, message == null ? "" : message, 14, false);
-        err.setTextColor(Theme.getColor(Theme.key_text_RedRegular));
-        final TextView remaining = text(c, "", 13, false);
-        p.addView(pw);
-        p.addView(err);
-        p.addView(remaining);
-        p.addView(button(c, "Unlock", new View.OnClickListener() {
+        container.removeAllViews();
+        final FrameLayout wall = new FrameLayout(c);
+        wall.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+        wall.setClickable(true);   // swallow taps, scrolls and long presses
+        wall.setFocusable(true);
+
+        final LinearLayout decoy = new LinearLayout(c);
+        decoy.setOrientation(LinearLayout.VERTICAL);
+        decoy.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(16), AndroidUtilities.dp(12), AndroidUtilities.dp(16));
+        decoy.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+        int[] widths = {220, 140, 260, 180, 100, 240, 160, 200};
+        for (int i = 0; i < widths.length; i++) {
+            View bubble = new View(c);
+            android.graphics.drawable.GradientDrawable d = new android.graphics.drawable.GradientDrawable();
+            d.setCornerRadius(AndroidUtilities.dp(16));
+            d.setColor(i % 2 == 0 ? 0xFF3A6EA5 : 0xFF5B6770);
+            bubble.setBackground(d);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(AndroidUtilities.dp(widths[i]), AndroidUtilities.dp(i % 3 == 0 ? 64 : 44));
+            lp.gravity = i % 2 == 0 ? android.view.Gravity.START : android.view.Gravity.END;
+            lp.topMargin = AndroidUtilities.dp(10);
+            decoy.addView(bubble, lp);
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            decoy.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(28f, 28f, android.graphics.Shader.TileMode.CLAMP));
+        }
+        wall.addView(decoy, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        View scrim = new View(c); // dims the decoy; on older Android this is what hides it
+        scrim.setBackgroundColor(android.os.Build.VERSION.SDK_INT >= 31 ? 0x88101820 : 0xEE101820);
+        wall.addView(scrim, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        final LinearLayout card = new LinearLayout(c);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
+        card.setPadding(AndroidUtilities.dp(22), AndroidUtilities.dp(22), AndroidUtilities.dp(22), AndroidUtilities.dp(18));
+        android.graphics.drawable.GradientDrawable cardBg = new android.graphics.drawable.GradientDrawable();
+        cardBg.setCornerRadius(AndroidUtilities.dp(26));
+        cardBg.setColor(0xF2182433);
+        cardBg.setStroke(AndroidUtilities.dp(1), 0x553C6EA8);
+        card.setBackground(cardBg);
+
+        card.addView(new LockIconView(c), new LinearLayout.LayoutParams(AndroidUtilities.dp(84), AndroidUtilities.dp(84)));
+        TextView title = text(c, "Enter Password", 24, true);
+        title.setTextColor(0xFFFFFFFF);
+        title.setGravity(android.view.Gravity.CENTER);
+        card.addView(title);
+        TextView sub = text(c, "This vault is protected. Please enter your password to continue.", 15, false);
+        sub.setTextColor(0xFFB9C4D2);
+        sub.setGravity(android.view.Gravity.CENTER);
+        sub.setPadding(0, AndroidUtilities.dp(6), 0, AndroidUtilities.dp(14));
+        card.addView(sub);
+
+        LinearLayout pwRow = new LinearLayout(c);
+        pwRow.setOrientation(LinearLayout.HORIZONTAL);
+        pwRow.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        android.graphics.drawable.GradientDrawable rowBg = new android.graphics.drawable.GradientDrawable();
+        rowBg.setCornerRadius(AndroidUtilities.dp(26));
+        rowBg.setColor(0x33000000);
+        rowBg.setStroke(AndroidUtilities.dp(1), 0x66789AC8);
+        pwRow.setBackground(rowBg);
+        pwRow.setPadding(AndroidUtilities.dp(16), 0, AndroidUtilities.dp(8), 0);
+        final EditText pw = new EditText(c);
+        pw.setHint("Password");
+        pw.setHintTextColor(0xFF7F8CA0);
+        pw.setTextColor(0xFFFFFFFF);
+        pw.setBackground(null);
+        pw.setSingleLine(true);
+        pw.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        pw.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_DONE | android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
+        pwRow.addView(pw, new LinearLayout.LayoutParams(0, AndroidUtilities.dp(52), 1f));
+        final TextView toggle = text(c, "Show", 14, true);
+        toggle.setTextColor(0xFF6FB1FF);
+        toggle.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12));
+        toggle.setOnClickListener(new View.OnClickListener() {
+            private boolean shown;
+
             @Override
             public void onClick(View v) {
+                shown = !shown;
+                int sel = pw.getSelectionEnd();
+                pw.setInputType(android.text.InputType.TYPE_CLASS_TEXT | (shown
+                        ? android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                        : android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD));
+                pw.setSelection(Math.max(0, sel));
+                toggle.setText(shown ? "Hide" : "Show");
+            }
+        });
+        pwRow.addView(toggle);
+        card.addView(pwRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        final TextView err = text(c, message == null ? "" : message, 14, false);
+        err.setTextColor(0xFFFF7A7A);
+        err.setGravity(android.view.Gravity.CENTER);
+        err.setPadding(0, AndroidUtilities.dp(8), 0, 0);
+        card.addView(err);
+        final TextView remaining = text(c, "", 12, false);
+        remaining.setTextColor(0xFF9AA8BA);
+        remaining.setGravity(android.view.Gravity.CENTER);
+        card.addView(remaining);
+
+        final TextView unlock = text(c, "Unlock  >", 17, true);
+        unlock.setTextColor(0xFFFFFFFF);
+        unlock.setGravity(android.view.Gravity.CENTER);
+        android.graphics.drawable.GradientDrawable btnBg = new android.graphics.drawable.GradientDrawable();
+        btnBg.setCornerRadius(AndroidUtilities.dp(28));
+        btnBg.setColor(0xFF1E88FF);
+        unlock.setBackground(btnBg);
+        final android.widget.ProgressBar spinner = new android.widget.ProgressBar(c);
+        spinner.setIndeterminate(true);
+        spinner.setVisibility(View.GONE);
+        FrameLayout btnFrame = new FrameLayout(c);
+        btnFrame.addView(unlock, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, AndroidUtilities.dp(52)));
+        FrameLayout.LayoutParams spLp = new FrameLayout.LayoutParams(AndroidUtilities.dp(26), AndroidUtilities.dp(26), android.view.Gravity.CENTER_VERTICAL | android.view.Gravity.END);
+        spLp.rightMargin = AndroidUtilities.dp(20);
+        btnFrame.addView(spinner, spLp);
+        LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        btnLp.topMargin = AndroidUtilities.dp(14);
+        card.addView(btnFrame, btnLp);
+
+        final TextView restore = text(c, "Restore with recovery phrase", 14, false);
+        restore.setTextColor(0xFF6FB1FF);
+        restore.setGravity(android.view.Gravity.CENTER);
+        restore.setPadding(0, AndroidUtilities.dp(14), 0, AndroidUtilities.dp(4));
+        restore.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startRestore();
+            }
+        });
+        card.addView(restore);
+
+        // One attempt at a time. The button can never be a silent no-op: it either starts an attempt (spinner, fields
+        // locked) or says why not.
+        final boolean[] busy = {false};
+        final View.OnClickListener attempt = new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (busy[0]) {
+                    return;
+                }
+                if (pw.getText().length() == 0) {
+                    err.setText("Enter your password.");
+                    return;
+                }
+                busy[0] = true;
+                final long started = android.os.SystemClock.elapsedRealtime();
                 final char[] password = chars(pw);
-                pw.setText("");
-                background(new Job() {
+                err.setText("");
+                unlock.setText("Unlocking…");
+                spinner.setVisibility(View.VISIBLE);
+                pw.setEnabled(false);
+                toggle.setEnabled(false);
+                restore.setEnabled(false);
+                final Runnable slow = new Runnable() {
+                    @Override
+                    public void run() {
+                        if (busy[0]) {
+                            remaining.setText("Checking your password with a deliberately slow, strong key derivation. This can take a few seconds.");
+                        }
+                    }
+                };
+                AndroidUtilities.runOnUIThread(slow, 2500);
+                final Runnable finish = new Runnable() {
+                    @Override
+                    public void run() {
+                        busy[0] = false;
+                        AndroidUtilities.cancelRunOnUIThread(slow);
+                        unlock.setText("Unlock  >");
+                        spinner.setVisibility(View.GONE);
+                        pw.setEnabled(true);
+                        toggle.setEnabled(true);
+                        restore.setEnabled(true);
+                    }
+                };
+                backgroundOn(rt.unlockIo(), new Job() {
                     @Override
                     public void run() throws Exception {
                         final VaultAccess.Report r = rt.access.unlock(password);
+                        FileLog.d("Vault: unlock ok in " + (android.os.SystemClock.elapsedRealtime() - started) + " ms");
                         ui(new Runnable() {
                             @Override
                             public void run() {
+                                finish.run();
+                                pw.setText("");
+                                if (destroyed) {
+                                    return;
+                                }
                                 rt.unlocked();
                                 decide();
                                 showAttemptReport(r);
@@ -634,24 +815,72 @@ public class VaultFragment extends BaseFragment {
                 }, null, new ErrorHandler() {
                     @Override
                     public void accept(VaultCryptoException e) {
-                        err.setText(messageFor(e));
+                        FileLog.e("Vault: unlock failed (" + e.getReason() + ") after " + (android.os.SystemClock.elapsedRealtime() - started) + " ms");
+                        finish.run();
+                        pw.setText("");
                         if (e.getReason() == VaultCryptoException.Reason.VAULT_WIPED) {
+                            err.setText(messageFor(e));
                             decide();
                             return;
                         }
+                        err.setText(e.getReason() == VaultCryptoException.Reason.WRONG_PASSWORD ? "Wrong password. Try again." : messageFor(e));
                         refreshRemaining(remaining);
                     }
                 });
             }
-        }));
-        p.addView(button(c, "Restore with recovery key", new View.OnClickListener() {
+        };
+        unlock.setOnClickListener(attempt);
+        pw.setOnEditorActionListener(new TextView.OnEditorActionListener() {
             @Override
-            public void onClick(View v) {
-                startRestore();
+            public boolean onEditorAction(TextView v, int actionId, android.view.KeyEvent event) {
+                attempt.onClick(v);
+                return true;
             }
-        }));
-        show(p);
+        });
+
+        FrameLayout.LayoutParams cardLp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, android.view.Gravity.CENTER);
+        cardLp.leftMargin = AndroidUtilities.dp(20);
+        cardLp.rightMargin = AndroidUtilities.dp(20);
+        ScrollView sv = new ScrollView(c);
+        sv.setFillViewport(true);
+        FrameLayout holder = new FrameLayout(c);
+        FrameLayout.LayoutParams maxW = new FrameLayout.LayoutParams(Math.min(AndroidUtilities.dp(380), AndroidUtilities.displaySize.x - AndroidUtilities.dp(40)),
+                ViewGroup.LayoutParams.WRAP_CONTENT, android.view.Gravity.CENTER);
+        holder.addView(card, maxW);
+        sv.addView(holder, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        wall.addView(sv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        container.addView(wall, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         refreshRemaining(remaining);
+    }
+
+    /** A round badge with a padlock, drawn in code (no resource needed). */
+    private static final class LockIconView extends View {
+        private final android.graphics.Paint paint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+
+        LockIconView(Context c) {
+            super(c);
+        }
+
+        @Override
+        protected void onDraw(android.graphics.Canvas canvas) {
+            float w = getWidth(), h = getHeight(), cx = w / 2f, cy = h / 2f, r = Math.min(w, h) / 2f;
+            paint.setStyle(android.graphics.Paint.Style.FILL);
+            paint.setColor(0xFF1B3A5E);
+            canvas.drawCircle(cx, cy, r * 0.86f, paint);
+            paint.setColor(0xFF3B8DFF);
+            android.graphics.RectF body = new android.graphics.RectF(cx - r * 0.34f, cy - r * 0.04f, cx + r * 0.34f, cy + r * 0.46f);
+            canvas.drawRoundRect(body, r * 0.1f, r * 0.1f, paint);
+            paint.setStyle(android.graphics.Paint.Style.STROKE);
+            paint.setStrokeWidth(r * 0.13f);
+            android.graphics.RectF shackle = new android.graphics.RectF(cx - r * 0.22f, cy - r * 0.50f, cx + r * 0.22f, cy + r * 0.08f);
+            canvas.drawArc(shackle, 180, 180, false, paint);
+            canvas.drawLine(cx - r * 0.22f, cy - r * 0.21f, cx - r * 0.22f, cy - r * 0.02f, paint);
+            canvas.drawLine(cx + r * 0.22f, cy - r * 0.21f, cx + r * 0.22f, cy - r * 0.02f, paint);
+            paint.setStyle(android.graphics.Paint.Style.FILL);
+            paint.setColor(0xFF10233B);
+            canvas.drawCircle(cx, cy + r * 0.18f, r * 0.07f, paint);
+        }
     }
 
     private void refreshRemaining(final TextView view) {
@@ -1563,22 +1792,30 @@ public class VaultFragment extends BaseFragment {
         @Override
         public View getView(int position, View convertView, ViewGroup parent) {
             VaultListModel.Row row = model.rows().get(position);
+            // Telegram-style message bubble: rounded, text first, time at the bottom right.
+            FrameLayout outer = new FrameLayout(context);
+            outer.setPadding(AndroidUtilities.dp(10), AndroidUtilities.dp(4), AndroidUtilities.dp(48), AndroidUtilities.dp(4));
             LinearLayout l = new LinearLayout(context);
             l.setOrientation(LinearLayout.VERTICAL);
-            l.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(8), AndroidUtilities.dp(16), AndroidUtilities.dp(8));
-            if (row.selected) {
-                l.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundGray));
-            }
+            l.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(6));
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setCornerRadii(new float[]{AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(16),
+                    AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(4), AndroidUtilities.dp(4)});
+            bg.setColor(row.selected ? Theme.getColor(Theme.key_windowBackgroundGray) : Theme.getColor(Theme.key_chat_inBubble));
+            l.setBackground(bg);
             TextView title = text(context, row.title, 16, false);
+            title.setTextColor(Theme.getColor(Theme.key_chat_messageTextIn));
             l.addView(title);
-            String sub = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(new Date(row.dateMillis));
+            String sub = DateFormat.getTimeInstance(DateFormat.SHORT).format(new Date(row.dateMillis));
             if (!row.subtitle.isEmpty()) {
                 sub = row.subtitle + " · " + sub;
             }
-            TextView subtitle = text(context, sub, 12, false);
-            subtitle.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText));
+            TextView subtitle = text(context, sub, 11, false);
+            subtitle.setTextColor(Theme.getColor(Theme.key_chat_inTimeText));
+            subtitle.setGravity(android.view.Gravity.END);
             l.addView(subtitle);
-            return l;
+            outer.addView(l, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, android.view.Gravity.START));
+            return outer;
         }
     }
 }

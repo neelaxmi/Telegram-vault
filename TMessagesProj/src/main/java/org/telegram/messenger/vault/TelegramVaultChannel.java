@@ -48,6 +48,19 @@ public final class TelegramVaultChannel {
         return MessagesController.getInstance(account).dialogsLoaded;
     }
 
+    /**
+     * True if {@code chatId} (the positive channel id used by chat screens) is this account's Vault storage channel.
+     * The Vault must never open as an ordinary chat (it would show encrypted blobs and a "Broadcast" composer), so
+     * the chat screen sends the user to the Vault screen instead.
+     */
+    public static boolean isVaultChannel(int account, long chatId) {
+        if (chatId == 0) {
+            return false;
+        }
+        TLRPC.Chat chat = MessagesController.getInstance(account).getChat(chatId);
+        return chat != null && isOurs(chat);
+    }
+
     /** The existing channel from the locally known chats, or null. Non-blocking. */
     public static Ref find(int account) {
         MessagesController controller = MessagesController.getInstance(account);

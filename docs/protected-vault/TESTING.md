@@ -1,7 +1,7 @@
 # Testing
 
-## 1. Automated tests: 447 passing (plain JVM, Java 21, JUnit 4.13.2)
-Run with `docs/protected-vault/tools/run-vault-tests.sh` (see BUILD_INSTRUCTIONS.md). Last result: `OK (447 tests)`, repeated runs stable.
+## 1. Automated tests: 475 passing (plain JVM, Java 21, JUnit 4.13.2)
+Run with `docs/protected-vault/tools/run-vault-tests.sh` (see BUILD_INSTRUCTIONS.md). Last result: `OK (475 tests)`, repeated runs stable.
 
 | Test class | Tests | Covers |
 |---|---|---|

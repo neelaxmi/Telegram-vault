@@ -66,6 +66,11 @@ public final class VaultAccess {
      * The journal file goes with the data directory handled by {@code store}. Never contacts the network.
      */
     public static WipeAction localWipe(final VaultKeyManager keys, final VaultStore store) {
+        return localWipe(keys, store, null);
+    }
+
+    /** As above, and also deletes the sealed inbox (items saved while locked and the inbox keys). */
+    public static WipeAction localWipe(final VaultKeyManager keys, final VaultStore store, final VaultInbox inbox) {
         return new WipeAction() {
             @Override
             public void wipe() throws VaultCryptoException {
@@ -74,6 +79,15 @@ public final class VaultAccess {
                     store.deleteAllData();
                 } catch (VaultCryptoException e) {
                     failure = e;
+                }
+                if (inbox != null) {
+                    try {
+                        inbox.deleteAll();
+                    } catch (VaultCryptoException e) {
+                        if (failure == null) {
+                            failure = e;
+                        }
+                    }
                 }
                 try {
                     keys.destroy();

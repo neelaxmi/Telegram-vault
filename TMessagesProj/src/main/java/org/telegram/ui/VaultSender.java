@@ -8,6 +8,7 @@ import org.telegram.messenger.UserObject;
 import org.telegram.messenger.vault.VaultCryptoException;
 import org.telegram.messenger.vault.VaultItem;
 import org.telegram.messenger.vault.VaultRuntime;
+import org.telegram.messenger.vault.VaultStore;
 import org.telegram.tgnet.TLRPC;
 
 import java.io.File;
@@ -78,8 +79,8 @@ public final class VaultSender {
     }
 
     /**
-     * Saves the message. The caller must be on the UI thread. If the Vault is locked nothing is
-     * saved and the user is told to unlock it first.
+     * Saves the message. The caller must be on the UI thread. A locked Vault does not need to be opened:
+     * the message is sealed into the write-only inbox (see VaultInbox).
      */
     public static void send(final int account, final MessageObject mo, final Result result) {
         final VaultRuntime rt = VaultRuntime.get(account);
@@ -91,10 +92,15 @@ public final class VaultSender {
             result.done("This kind of message cannot be saved to the Vault.");
             return;
         }
-        if (!rt.keys.isUnlocked()) {
-            result.done(rt.keys.isInitialized()
-                    ? "Unlock the Protected Vault first, then try again."
-                    : "Set up the Protected Vault first (menu, Protected Vault).");
+        if (!rt.keys.isInitialized()) {
+            result.done("Set up the Protected Vault first (menu, Protected Vault).");
+            return;
+        }
+        // Unlocked: save straight into the Vault. Locked: seal the message into the write-only inbox (public-key
+        // encryption, no password and no master key needed); it moves into the Vault at the next unlock.
+        final boolean locked = !rt.keys.isUnlocked();
+        if (locked && !rt.inbox.canAccept()) {
+            result.done("Open the Protected Vault and unlock it once. After that you can save messages without unlocking.");
             return;
         }
         final VaultItem.Type type = typeOf(mo);
@@ -121,25 +127,42 @@ public final class VaultSender {
                     0, 0, (int) Math.max(0, mo.getDuration()));
         }
         final File mediaFile = file;
-        rt.io().execute(() -> {
+        // the locked path must never queue behind a long network sync, so it has its own thread
+        (locked ? rt.inboxIo() : rt.io()).execute(() -> {
             String message;
             try {
-                if (mediaFile == null) {
-                    rt.engine().addItem(draft, null, null);
-                } else {
-                    try (InputStream in = new FileInputStream(mediaFile)) {
-                        rt.engine().addItem(draft, in, null);
+                if (locked || !rt.keys.isUnlocked()) {
+                    // The Vault may have locked since the check above: the sealed inbox still works.
+                    long limit = VaultStore.DEFAULT_MAX_UPLOAD_BYTES;
+                    if (mediaFile == null) {
+                        rt.inbox.put(draft, null, limit);
+                    } else {
+                        try (InputStream in = new FileInputStream(mediaFile)) {
+                            rt.inbox.put(draft, in, limit);
+                        }
                     }
+                    message = "Saved to the Protected Vault. It is encrypted and will appear when you open the Vault.";
+                } else {
+                    if (mediaFile == null) {
+                        rt.engine().addItem(draft, null, null);
+                    } else {
+                        try (InputStream in = new FileInputStream(mediaFile)) {
+                            rt.engine().addItem(draft, in, null);
+                        }
+                    }
+                    message = "Saved to the Protected Vault.";
+                    rt.coordinator().requestSync(false);
                 }
-                message = "Saved to the Protected Vault.";
-                rt.coordinator().requestSync(false);
             } catch (VaultCryptoException e) {
                 switch (e.getReason()) {
                     case MEDIA_TOO_LARGE:
                         message = "This file is larger than the Vault can store (Telegram's file size limit).";
                         break;
                     case INVALID_STATE:
-                        message = "The Vault locked. Unlock it and try again.";
+                        message = "The Vault locked. Try again.";
+                        break;
+                    case CORRUPTED:
+                        message = "The Vault's save-while-locked key looks damaged, so nothing was saved. Unlock the Vault once to repair it.";
                         break;
                     default:
                         message = "Could not save to the Vault.";
