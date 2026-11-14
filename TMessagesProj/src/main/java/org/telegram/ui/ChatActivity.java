@@ -1647,6 +1647,8 @@ public class ChatActivity extends BaseFragment implements
     private final static int chat_enc_timer = 13;
     private final static int chat_menu_attach = 14;
     private final static int chat_menu_search = -1;
+    private final static int vault_settings = 9101;
+    private final static int vault_lock = 9102;
     private final static int chat_menu_options = -2;
     private final static int chat_menu_edit_text_options = -3;
     private final static int clear_history = 15;
@@ -2714,10 +2716,35 @@ public class ChatActivity extends BaseFragment implements
     }
 
     private NotificationCenter.ObserversGroup observersGroup;
+    /** True while this screen shows the Protected Vault chat (opened only after the password). */
+    private boolean vaultChatMode;
+    private Runnable vaultLockCallback;
 
     @Override
     public boolean onFragmentCreate() {
         final long chatId = arguments.getLong("chat_id", 0);
+        vaultChatMode = org.telegram.messenger.vault.VaultChatLink.isVaultChat(currentAccount, chatId);
+        if (vaultChatMode) {
+            final org.telegram.messenger.vault.VaultRuntime vrt = org.telegram.messenger.vault.VaultRuntime.get(currentAccount);
+            if (!vrt.keys.isUnlocked()) {
+                // The password wall comes first: no message of the Vault chat is loaded or drawn while locked.
+                AndroidUtilities.runOnUIThread(() -> {
+                    BaseFragment last = LaunchActivity.getSafeLastFragment();
+                    if (last != null && !(last instanceof VaultFragment)) {
+                        last.presentFragment(new VaultFragment());
+                    }
+                });
+                vaultChatMode = false;
+                return false;
+            }
+            vaultLockCallback = () -> {
+                // The Vault locked (timer, leaving the app, or "Lock now"): leave the chat and show the wall.
+                if (parentLayout != null && !isFinished && !finishing) {
+                    presentFragment(new VaultFragment(), true);
+                }
+            };
+            vrt.setOnLockedUi(vaultLockCallback);
+        }
         if (org.telegram.messenger.vault.TelegramVaultChannel.isVaultChannel(currentAccount, chatId)) {
             // The Vault's storage channel holds only encrypted blobs and must not open as an ordinary channel chat.
             AndroidUtilities.runOnUIThread(() -> {
@@ -3415,6 +3442,13 @@ public class ChatActivity extends BaseFragment implements
     @Override
     public void onFragmentDestroy() {
         super.onFragmentDestroy();
+        if (vaultChatMode) {
+            vaultChatMode = false;
+            org.telegram.messenger.vault.VaultRuntime.get(currentAccount).setOnLockedUi(null);
+            if (getParentActivity() != null) {
+                getParentActivity().getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+            }
+        }
         if (messageMetricsView != null) {
             messageMetricsView.finish();
         }
@@ -4020,6 +4054,10 @@ public class ChatActivity extends BaseFragment implements
                     getSendMessagesHelper().sendMessage(SendMessagesHelper.SendMessageParams.of("/help", dialog_id, null, null, null, false, null, null, null, true, 0, 0, null, false));
                 } else if (id == bot_settings) {
                     getSendMessagesHelper().sendMessage(SendMessagesHelper.SendMessageParams.of("/settings", dialog_id, null, null, null, false, null, null, null, true, 0, 0, null, false));
+                } else if (id == vault_lock) {
+                    org.telegram.messenger.vault.VaultRuntime.get(currentAccount).lockNow();
+                } else if (id == vault_settings) {
+                    presentFragment(new VaultFragment(true));
                 } else if (id == search) {
                     openSearchWithText(isSupportedTags() ? "" : null);
                 } else if (id == translate) {
@@ -4476,6 +4514,10 @@ public class ChatActivity extends BaseFragment implements
 
             if (searchItem != null) {
                 headerItem.lazilyAddSubItem(search, R.drawable.msg_search, LocaleController.getString(R.string.Search));
+            }
+            if (vaultChatMode) {
+                headerItem.lazilyAddSubItem(vault_settings, R.drawable.msg_settings, "Vault settings");
+                headerItem.lazilyAddSubItem(vault_lock, R.drawable.msg_secret, "Lock Vault");
             }
             if (ChatObject.isBoostSupported(currentChat) && (getUserConfig().isPremium() || ChatObject.isBoosted(chatInfo) || ChatObject.hasAdminRights(currentChat))) {
                 RLottieDrawable drawable = new RLottieDrawable(R.raw.boosts, dp(24), dp(24));
@@ -30068,6 +30110,14 @@ public class ChatActivity extends BaseFragment implements
     @Override
     public void onResume() {
         super.onResume();
+        if (vaultChatMode) {
+            // the settings screen on top of this chat uses the same hook; take it back
+            org.telegram.messenger.vault.VaultRuntime.get(currentAccount).setOnLockedUi(vaultLockCallback);
+        }
+        if (vaultChatMode && getParentActivity() != null) {
+            // no screenshots and a blank app-switcher picture while the Vault chat exists
+            getParentActivity().getWindow().setFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE, android.view.WindowManager.LayoutParams.FLAG_SECURE);
+        }
         checkShowBlur(false);
         activityResumeTime = System.currentTimeMillis();
         if (openImport && getSendMessagesHelper().getImportingHistory(dialog_id) != null) {

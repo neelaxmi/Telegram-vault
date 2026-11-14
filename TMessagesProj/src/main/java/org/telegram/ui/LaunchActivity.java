@@ -6845,6 +6845,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     @Override
     protected void onPause() {
         super.onPause();
+        org.telegram.messenger.vault.VaultRuntime.appBackground(UserConfig.selectedAccount);
         isResumed = false;
         pipActivityHandler.onPause();
         NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.stopAllHeavyOperations, 4096);
@@ -7083,6 +7084,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     @Override
     protected void onResume() {
         super.onResume();
+        org.telegram.messenger.vault.VaultRuntime.appForeground(UserConfig.selectedAccount);
         isResumed = true;
         pipActivityHandler.onResume();
         if (onResumeStaticCallback != null) {
@@ -8554,6 +8556,12 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             return true;
         }
         return false;
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        org.telegram.messenger.vault.VaultRuntime.touched(UserConfig.selectedAccount);
+        return super.dispatchTouchEvent(ev);
     }
 
     @Override

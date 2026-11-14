@@ -140,6 +140,30 @@ public final class VaultRuntime {
         return dir;
     }
 
+    /** The whole app went to the background (called by the main activity). Locks if "lock when I leave the app" is on. */
+    public static void appBackground(int account) {
+        VaultRuntime rt = get(account);
+        if (rt.keys.isUnlocked()) {
+            rt.autoLock.onBackground();
+        }
+    }
+
+    /** The app came back: locks first if the time away was too long. */
+    public static void appForeground(int account) {
+        VaultRuntime rt = get(account);
+        if (rt.keys.isUnlocked()) {
+            rt.autoLock.onForeground();
+        }
+    }
+
+    /** Any touch anywhere in the app: keeps the inactivity timer from locking a Vault that is in use. */
+    public static void touched(int account) {
+        VaultRuntime rt = get(account);
+        if (rt.keys.isUnlocked()) {
+            rt.autoLock.userActivity();
+        }
+    }
+
     /** Called (on the UI thread) when the Vault locks itself or is locked manually, so open screens can close. */
     public void setOnLockedUi(Runnable r) {
         onLockedUi = r;

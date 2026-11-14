@@ -35,6 +35,7 @@ import org.telegram.messenger.vault.SetupSession;
 import org.telegram.messenger.vault.SyncCoordinator;
 import org.telegram.messenger.vault.VaultAccess;
 import org.telegram.messenger.vault.VaultCategory;
+import org.telegram.messenger.vault.VaultChatLink;
 import org.telegram.messenger.vault.VaultCryptoException;
 import org.telegram.messenger.vault.VaultTempFiles;
 import org.telegram.messenger.vault.VaultItem;
@@ -72,6 +73,7 @@ public class VaultFragment extends BaseFragment {
     private static final long MAX_INLINE_PHOTO_BYTES = 20L * 1024 * 1024;
 
     private VaultRuntime rt;
+    private boolean settingsOnly;
     private FrameLayout container;
     /** Owns the set-up flow; the UI never keeps its own reference (a stale one caused a crash after a pause). */
     private SetupSession session;
@@ -86,6 +88,14 @@ public class VaultFragment extends BaseFragment {
     private boolean destroyed;
     /** True while another app (the file picker) is on top: that must not lock the Vault. */
     private boolean launching;
+
+    public VaultFragment() {
+    }
+
+    /** {@code settingsOnly}: opened from the Vault chat's menu; shows only the settings after the password. */
+    public VaultFragment(boolean settingsOnly) {
+        this.settingsOnly = settingsOnly;
+    }
 
     @Override
     public boolean onFragmentCreate() {
@@ -1093,7 +1103,84 @@ public class VaultFragment extends BaseFragment {
         }
     }
 
+    /** After the password: the real Telegram chat screen of the Vault chat (or, from its menu, the settings page). */
     private void showList() {
+        if (settingsOnly) {
+            showSettingsPage();
+        } else {
+            openVaultChat();
+        }
+    }
+
+    private void showSettingsPage() {
+        Context c = container.getContext();
+        container.removeAllViews();
+        actionBar.createMenu().clearItems();
+        actionBar.setTitle("Vault settings");
+        LinearLayout p = page(c);
+        p.addView(button(c, "Vault settings\u2026", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showSettings();
+            }
+        }));
+        p.addView(button(c, "Back to the Vault chat", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                finishFragment();
+            }
+        }));
+        show(p);
+        showSettings();
+    }
+
+    private void openVaultChat() {
+        Context c = container.getContext();
+        container.removeAllViews();
+        final int account = UserConfig.selectedAccount;
+        LinearLayout p = page(c);
+        final TextView msg = text(c, "Opening your Vault chat\u2026", 16, false);
+        p.addView(msg);
+        final Button retry = button(c, "Try again", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openVaultChat();
+            }
+        });
+        retry.setVisibility(View.GONE);
+        p.addView(retry);
+        show(p);
+        final long[] id = new long[1];
+        background(new Job() {
+            @Override
+            public void run() throws Exception {
+                long found = VaultChatLink.find(account);
+                if (found == 0) {
+                    if (!org.telegram.messenger.vault.TelegramVaultChannel.chatsLoaded(account)) {
+                        throw new IOException("Telegram is still loading your chats. Wait a moment and try again.");
+                    }
+                    found = VaultChatLink.create(account);
+                }
+                id[0] = found;
+            }
+        }, new Runnable() {
+            @Override
+            public void run() {
+                android.os.Bundle args = new android.os.Bundle();
+                args.putLong("chat_id", id[0]);
+                presentFragment(new ChatActivity(args), true);
+            }
+        }, new ErrorHandler() {
+            @Override
+            public void accept(VaultCryptoException e) {
+                msg.setText("Could not open the Vault chat: " + e.getMessage());
+                retry.setVisibility(View.VISIBLE);
+            }
+        });
+    }
+
+    // The earlier encrypted-store chat screen below is no longer reached; it is kept only as source.
+    private void showEncryptedList() {
         final Context c = container.getContext();
         container.removeAllViews();
         stopAudio();

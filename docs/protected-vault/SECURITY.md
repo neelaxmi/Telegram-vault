@@ -65,3 +65,13 @@ The cloud copy of the Vault is a private Telegram channel holding only encrypted
 * Unlocked: previews are decrypted into a small in-memory cache that is cleared on lock. Photos open from memory only. Video, audio and "open document" need a file on disk for Android's players and other apps: the decrypted copy is written to a private folder (`files/vault-open/`, one random sub-folder per copy), overwritten with zeros and deleted when the viewer closes, when the Vault locks, when the screen is destroyed and at the next start. While such a copy exists it is readable by the app and, for "Open", by the app you chose. This is a deliberate, documented limit; Export is the other explicit way out.
 * The photo and video viewers are FLAG_SECURE windows, like the Vault screen.
 * Not preserved: custom emoji; old app versions show version-2 items as "needs update".
+
+## Vault as a real chat (user decision, 2026-11-14) - READ THIS
+
+At the user's request the Vault now opens Telegram's own chat screen (`ChatActivity`) on a private group called "Telegram Vault" that only this account is in. Messages in it are ORDINARY Telegram messages stored by Telegram. The Vault password, the blurred wall, auto-lock, FLAG_SECURE and the lock-on-leaving-the-app are an access gate for the screen; they do NOT encrypt those messages, and they do not protect them from anyone who can reach the account on another Telegram client, nor from Telegram. The "Send to Vault" action forwards the message into this chat.
+
+Consequences, stated plainly:
+* The encrypted store, the sealed inbox and the encrypted-channel sync still exist in the source and keep their tests, but the Vault screen no longer uses them, so media in the chat is not encrypted by the Vault.
+* The chat shows in the normal chat list (muted). Opening it from there is redirected to the password wall; the last-message preview in the list is NOT hidden.
+* While the Vault chat is open, the app locks when it goes to the background, after the inactivity time, or with "Lock Vault"; the chat is then replaced by the wall.
+* Not run on a device; CI only proves it compiles.
