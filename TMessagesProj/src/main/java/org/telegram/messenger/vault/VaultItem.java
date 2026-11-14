@@ -55,7 +55,18 @@ public final class VaultItem {
     public static final int MAX_TEXT_CHARS = 100_000;
     public static final int MAX_NAME_CHARS = 1_000;
 
-    static final int FORMAT_VERSION = 1;
+    /** Record format written by this version. Version 1 (no flags/entities) is still read. */
+    static final int FORMAT_VERSION = 2;
+
+    /** A voice message (play with the voice-note player). */
+    public static final int FLAG_VOICE = 1;
+    /** Music / audio file (play with the audio player). */
+    public static final int FLAG_MUSIC = 2;
+    /** Round video message. */
+    public static final int FLAG_ROUND_VIDEO = 4;
+    /** Animation (GIF-style looping video). */
+    public static final int FLAG_ANIMATION = 8;
+    public static final int MAX_ENTITIES_CHARS = 200_000;
     static final int PAD_BLOCK = 256;
     private static final int MAX_STRING_BYTES = 1 << 20;
 
@@ -82,11 +93,27 @@ public final class VaultItem {
     public final int height;
     public final int durationSeconds;
     public final String thumbnailId;
+    /** Combination of FLAG_* values; 0 for items written before format version 2. */
+    public final int flags;
+    /** Text formatting as written by {@link VaultEntities}; empty if none. */
+    public final String entities;
 
     VaultItem(String id, Type type, long createdAtMillis, long originalDateMillis, String text,
               String senderName, String forwardedFromName, long forwardedDateMillis,
               long sourceDialogId, long sourceMessageId, String mediaId, String mediaName,
               String mimeType, long mediaSize, int width, int height, int durationSeconds, String thumbnailId) {
+        this(id, type, createdAtMillis, originalDateMillis, text, senderName, forwardedFromName, forwardedDateMillis,
+                sourceDialogId, sourceMessageId, mediaId, mediaName, mimeType, mediaSize, width, height, durationSeconds,
+                thumbnailId, 0, "");
+    }
+
+    VaultItem(String id, Type type, long createdAtMillis, long originalDateMillis, String text,
+              String senderName, String forwardedFromName, long forwardedDateMillis,
+              long sourceDialogId, long sourceMessageId, String mediaId, String mediaName,
+              String mimeType, long mediaSize, int width, int height, int durationSeconds, String thumbnailId,
+              int flags, String entities) {
+        this.flags = flags;
+        this.entities = entities == null ? "" : entities;
         this.id = id;
         this.type = type;
         this.createdAtMillis = createdAtMillis;
@@ -105,6 +132,18 @@ public final class VaultItem {
         this.height = height;
         this.durationSeconds = durationSeconds;
         this.thumbnailId = thumbnailId;
+    }
+
+    public boolean isVoice() {
+        return (flags & FLAG_VOICE) != 0;
+    }
+
+    public boolean isMusic() {
+        return (flags & FLAG_MUSIC) != 0;
+    }
+
+    public boolean isRoundVideo() {
+        return (flags & FLAG_ROUND_VIDEO) != 0;
     }
 
     public boolean isForwarded() {
@@ -128,6 +167,8 @@ public final class VaultItem {
         int width;
         int height;
         int durationSeconds;
+        int flags;
+        String entities = "";
 
         public Draft(Type type) {
             this.type = type;
@@ -170,6 +211,18 @@ public final class VaultItem {
             return this;
         }
 
+        /** Kind flags (FLAG_VOICE, FLAG_MUSIC, ...). */
+        public Draft flags(int v) {
+            this.flags = v;
+            return this;
+        }
+
+        /** Formatting of {@link #text}, as produced by {@link VaultEntities#encode}. */
+        public Draft entities(String v) {
+            this.entities = v == null ? "" : v;
+            return this;
+        }
+
         void validate() throws VaultCryptoException {
             if (type == null) {
                 throw invalid("Item type required");
@@ -184,6 +237,9 @@ public final class VaultItem {
             checkName(forwardedFromName);
             checkName(mediaName);
             checkName(mimeType);
+            if (entities == null || entities.length() > MAX_ENTITIES_CHARS || flags < 0 || flags > 0xFF) {
+                throw invalid("Entities or flags out of range");
+            }
             if (width < 0 || height < 0 || durationSeconds < 0 || originalDateMillis < 0 || forwardedDateMillis < 0) {
                 throw invalid("Negative value");
             }
@@ -202,7 +258,7 @@ public final class VaultItem {
         VaultItem toItem(String id, long createdAtMillis, String mediaId, long mediaSize, String thumbnailId) {
             return new VaultItem(id, type, createdAtMillis, originalDateMillis, text, senderName, forwardedFromName,
                     forwardedDateMillis, sourceDialogId, sourceMessageId, mediaId, mediaName, mimeType, mediaSize,
-                    width, height, durationSeconds, thumbnailId);
+                    width, height, durationSeconds, thumbnailId, flags, entities);
         }
     }
 
@@ -231,6 +287,8 @@ public final class VaultItem {
             out.writeInt(height);
             out.writeInt(durationSeconds);
             writeString(out, thumbnailId);
+            out.writeInt(flags);
+            writeString(out, entities);
             out.flush();
             byte[] payload = bos.toByteArray();
 
@@ -267,7 +325,7 @@ public final class VaultItem {
                 throw new VaultCryptoException(VaultCryptoException.Reason.UNSUPPORTED_VERSION,
                         "Item was written by a newer app version");
             }
-            if (version != FORMAT_VERSION) {
+            if (version != FORMAT_VERSION && version != 1) {
                 throw corrupted("Unsupported record version");
             }
             String id = readString(in);
@@ -288,6 +346,18 @@ public final class VaultItem {
             int height = in.readInt();
             int duration = in.readInt();
             String thumbnailId = readString(in);
+            int flags = 0;
+            String entities = "";
+            if (version >= 2) {
+                flags = in.readInt();
+                entities = readString(in);
+                if (entities == null) {
+                    entities = "";
+                }
+                if (flags < 0 || flags > 0xFF) {
+                    throw corrupted("Record flags invalid");
+                }
+            }
             if (in.available() != 0) {
                 throw corrupted("Trailing bytes in record");
             }
@@ -298,7 +368,8 @@ public final class VaultItem {
                 throw corrupted("Record fields inconsistent");
             }
             return new VaultItem(id, type, createdAt, originalDate, text, senderName, forwardedFrom, forwardedDate,
-                    sourceDialog, sourceMessage, mediaId, mediaName, mimeType, mediaSize, width, height, duration, thumbnailId);
+                    sourceDialog, sourceMessage, mediaId, mediaName, mimeType, mediaSize, width, height, duration, thumbnailId,
+                    flags, entities);
         } catch (IOException e) {
             throw corrupted("Record is truncated");
         }

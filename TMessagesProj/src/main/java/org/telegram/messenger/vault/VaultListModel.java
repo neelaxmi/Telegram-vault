@@ -21,6 +21,8 @@ public final class VaultListModel {
         public final long dateMillis;
         public final boolean hasMedia;
         public final boolean selected;
+        /** The full record: everything the chat cells need (kind, size, name, formatting, thumbnail id). */
+        public final VaultItem item;
 
         Row(VaultItem item, boolean selected) {
             this.id = item.id;
@@ -30,6 +32,7 @@ public final class VaultListModel {
             this.dateMillis = item.originalDateMillis > 0 ? item.originalDateMillis : item.createdAtMillis;
             this.hasMedia = item.mediaId != null;
             this.selected = selected;
+            this.item = item;
         }
     }
 
@@ -37,6 +40,7 @@ public final class VaultListModel {
 
     private final VaultStore store;
     private String query = "";
+    private VaultCategory category = VaultCategory.ALL;
     private List<VaultItem> shown = new ArrayList<>();
     private final Set<String> selection = new LinkedHashSet<>();
     private int corrupt;
@@ -54,7 +58,18 @@ public final class VaultListModel {
         VaultStore.Listing listing = store.list();
         corrupt = listing.corruptIds.size();
         unsupported = listing.unsupportedIds.size();
-        shown = store.search(query);
+        List<VaultItem> found = store.search(query);
+        if (category == VaultCategory.ALL) {
+            shown = found;
+        } else {
+            List<VaultItem> filtered = new ArrayList<>();
+            for (VaultItem i : found) {
+                if (category.matches(i)) {
+                    filtered.add(i);
+                }
+            }
+            shown = filtered;
+        }
         Set<String> alive = new LinkedHashSet<>();
         for (VaultItem i : listing.items) {
             alive.add(i.id);
@@ -65,6 +80,15 @@ public final class VaultListModel {
     public synchronized void setQuery(String text) throws VaultCryptoException {
         query = text == null ? "" : text;
         refresh();
+    }
+
+    public synchronized void setCategory(VaultCategory c) throws VaultCryptoException {
+        category = c == null ? VaultCategory.ALL : c;
+        refresh();
+    }
+
+    public synchronized VaultCategory category() {
+        return category;
     }
 
     public synchronized String query() {

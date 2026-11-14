@@ -114,6 +114,14 @@ public final class VaultInbox {
      * @throws VaultCryptoException INVALID_STATE if there is no inbox key yet; MEDIA_TOO_LARGE; IO_ERROR
      */
     public synchronized String put(VaultItem.Draft draft, InputStream media, long maxBytes) throws VaultCryptoException {
+        return put(draft, media, null, maxBytes);
+    }
+
+    /** As {@link #put(VaultItem.Draft, InputStream, long)}, with a preview image (at most {@link VaultStore#MAX_THUMBNAIL_BYTES}). */
+    public synchronized String put(VaultItem.Draft draft, InputStream media, byte[] thumbnail, long maxBytes) throws VaultCryptoException {
+        if (thumbnail != null && (media == null || thumbnail.length == 0 || thumbnail.length > VaultStore.MAX_THUMBNAIL_BYTES)) {
+            throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_ARGUMENT, "Thumbnail not allowed or too large");
+        }
         if (draft == null || draft.type == null) {
             throw new VaultCryptoException(VaultCryptoException.Reason.INVALID_ARGUMENT, "Draft required");
         }
@@ -147,7 +155,7 @@ public final class VaultInbox {
                     throw new IOException("rename failed");
                 }
             }
-            byte[] payload = encodePayload(draft, cek, mediaBytes);
+            byte[] payload = encodePayload(draft, cek, mediaBytes, thumbnail);
             byte[] sealed;
             try {
                 sealed = seal(recipient, payload, id);
@@ -303,11 +311,25 @@ public final class VaultInbox {
             if (draft.type.hasMedia() != hasMedia) {
                 throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Inbox envelope is inconsistent");
             }
+            byte[] thumbnail = null;
+            if (in.available() > 0) { // extension written by this version
+                draft.flags = in.readInt();
+                String entities = readString(in);
+                draft.entities = entities == null ? "" : entities;
+                int thumbLen = in.readInt();
+                if (thumbLen >= 0) {
+                    if (thumbLen == 0 || thumbLen > VaultStore.MAX_THUMBNAIL_BYTES || thumbLen > in.available()) {
+                        throw new VaultCryptoException(VaultCryptoException.Reason.CORRUPTED, "Inbox preview invalid");
+                    }
+                    thumbnail = new byte[thumbLen];
+                    in.readFully(thumbnail);
+                }
+            }
             if (!hasMedia) {
                 store.addItem(draft, null, null);
             } else {
                 File mediaFile = new File(dir, id + ".media");
-                addWithDecryptedMedia(store, draft, mediaFile, cek, id);
+                addWithDecryptedMedia(store, draft, mediaFile, cek, thumbnail, id);
             }
             File media = new File(dir, id + ".media");
             VaultFiles.secureDelete(envFile);
@@ -323,7 +345,7 @@ public final class VaultInbox {
     }
 
     /** Decrypts the media file through a pipe straight into {@code store.addItem}: no plaintext copy ever touches the disk. */
-    private void addWithDecryptedMedia(VaultStore store, VaultItem.Draft draft, final File mediaFile, final byte[] cek, final String id)
+    private void addWithDecryptedMedia(VaultStore store, VaultItem.Draft draft, final File mediaFile, final byte[] cek, byte[] thumbnail, final String id)
             throws VaultCryptoException, IOException {
         final PipedInputStream pipeIn = new PipedInputStream(64 * 1024);
         final PipedOutputStream pipeOut = new PipedOutputStream(pipeIn);
@@ -347,7 +369,7 @@ public final class VaultInbox {
         }, "vault-inbox-decrypt");
         t.start();
         try {
-            store.addItem(draft, pipeIn, null);
+            store.addItem(draft, pipeIn, thumbnail);
         } catch (VaultCryptoException e) {
             pipeIn.close(); // unblocks the writer
             throw e;
@@ -454,7 +476,7 @@ public final class VaultInbox {
 
     // ------------------------------------------------------------------ payload
 
-    private static byte[] encodePayload(VaultItem.Draft d, byte[] cek, long mediaBytes) throws IOException {
+    private static byte[] encodePayload(VaultItem.Draft d, byte[] cek, long mediaBytes, byte[] thumbnail) throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         DataOutputStream out = new DataOutputStream(bos);
         out.writeByte(d.type.code);
@@ -474,6 +496,13 @@ public final class VaultInbox {
         out.writeLong(mediaBytes);
         if (cek != null) {
             out.write(cek);
+        }
+        // extension (envelopes written before it end here): kind flags, formatting, preview image
+        out.writeInt(d.flags);
+        writeString(out, d.entities);
+        out.writeInt(thumbnail == null ? -1 : thumbnail.length);
+        if (thumbnail != null) {
+            out.write(thumbnail);
         }
         out.flush();
         return bos.toByteArray();
