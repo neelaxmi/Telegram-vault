@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   jvm-tests:
-    name: Vault JVM tests (475 expected)
+    name: Vault JVM tests (493 expected)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -43,7 +43,7 @@ jobs:
           set -o pipefail
           JUNIT_DIR="$RUNNER_TEMP/junit" bash docs/protected-vault/tools/run-vault-tests.sh | tee "$RUNNER_TEMP/jvm-tests.log"
           tail -n 3 "$RUNNER_TEMP/jvm-tests.log"
-          grep -q "^OK (475 tests)" "$RUNNER_TEMP/jvm-tests.log"
+          grep -q "^OK (493 tests)" "$RUNNER_TEMP/jvm-tests.log"
 
   build-debug-apk:
     name: Build debug APK

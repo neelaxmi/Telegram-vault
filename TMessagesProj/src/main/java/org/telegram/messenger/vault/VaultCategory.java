@@ -35,7 +35,7 @@ public enum VaultCategory {
         }
     }
 
-    static boolean isMusic(VaultItem item) {
+    public static boolean isMusic(VaultItem item) {
         if (item.type != VaultItem.Type.DOCUMENT || item.isVoice()) {
             return false;
         }

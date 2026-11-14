@@ -4,7 +4,7 @@ A password-protected, end-to-end encrypted "Saved Messages"-like space added to 
 source (DrKLO/Telegram 13.1.1, base commit `3de37c8`).
 
 > **Status, stated plainly.** The cryptography, storage, sync, device-linking, key-rotation and access-control
-> logic is plain Java and is covered by 475 automated JVM tests, all passing. **The full Android app now compiles:
+> logic is plain Java and is covered by 493 automated JVM tests, all passing. **The full Android app now compiles:
 > GitHub Actions built a debug APK (`.github/workflows/android-build.yml`, arm64-v8a only). It has never been installed or run, and
 > nothing has been tested against real Telegram servers.** The Android screens and the Telegram glue are therefore compiled but unexercised. Treat everything on the Android side
 > as unverified until the manual checks in [TESTING.md](TESTING.md) have been done on a device.

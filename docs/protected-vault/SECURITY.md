@@ -57,3 +57,11 @@ not tested against Telegram's servers.** Do not rely on it for anything that mat
 
 ## Vault storage channel
 The cloud copy of the Vault is a private Telegram channel holding only encrypted blobs; local storage is the encrypted VaultStore. The channel cannot be opened as an ordinary chat inside this app any more (ChatActivity redirects to the Vault screen); it still exists on the server and is visible, muted, in the chat list and on other Telegram clients as a channel of opaque files.
+
+## Media in the Vault chat (format version 2)
+
+* Every item keeps its real type (photo, video, document) plus kind flags (voice, music, round video, animation), formatting entities and a preview image. Media bytes and previews are encrypted (chunked AES-GCM under keys derived from the vault key) before they are stored; nothing is converted to text.
+* Locked: nothing is decrypted and no preview is drawn; the wall shows a decoy, not real content. Items saved while locked go through the sealed write-only inbox, which now also carries flags, formatting and the preview.
+* Unlocked: previews are decrypted into a small in-memory cache that is cleared on lock. Photos open from memory only. Video, audio and "open document" need a file on disk for Android's players and other apps: the decrypted copy is written to a private folder (`files/vault-open/`, one random sub-folder per copy), overwritten with zeros and deleted when the viewer closes, when the Vault locks, when the screen is destroyed and at the next start. While such a copy exists it is readable by the app and, for "Open", by the app you chose. This is a deliberate, documented limit; Export is the other explicit way out.
+* The photo and video viewers are FLAG_SECURE windows, like the Vault screen.
+* Not preserved: custom emoji; old app versions show version-2 items as "needs update".

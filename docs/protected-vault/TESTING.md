@@ -1,7 +1,7 @@
 # Testing
 
-## 1. Automated tests: 475 passing (plain JVM, Java 21, JUnit 4.13.2)
-Run with `docs/protected-vault/tools/run-vault-tests.sh` (see BUILD_INSTRUCTIONS.md). Last result: `OK (475 tests)`, repeated runs stable.
+## 1. Automated tests: 493 passing (plain JVM, Java 21, JUnit 4.13.2)
+Run with `docs/protected-vault/tools/run-vault-tests.sh` (see BUILD_INSTRUCTIONS.md). Last result: `OK (493 tests)`, repeated runs stable.
 
 | Test class | Tests | Covers |
 |---|---|---|
@@ -68,3 +68,9 @@ refusal in a protected chat; unlock with failed-attempt report; settings; link-d
 
 ## Setup lifecycle fix (13 Nov 2026)
 Device log showed `NullPointerException ... SetupFlow.confirm()` at `VaultFragment$10.onClick`: `onPause()` cancelled the flow and set the field to null, but the recovery/confirm screens stayed on display, so the next tap ran on null. Fix: `SetupSession` owns the flow (never null: INVALID_STATE instead), keeps it for a 5-minute grace period while the app is away, the UI hides the phrase while paused and redraws the current step on return, and an expired setup restarts with a NEW phrase (nothing is written before confirmation). Regression tests: `SetupSessionTest` (13), `RecoveryPhraseTest` (14). **Not verified on a device** until the new APK is tried: pause the app on the confirm screen, return, confirm.
+
+## 5. Saved-Messages-style chat: what is and is not verified
+
+Verified by the JVM tests (`VaultMediaKindsTest`, `VaultTempFilesTest`, plus the existing suites): a photo, video, PDF/document, voice message, forwarded photo and formatted text are stored with their type, bytes, name, size, duration, kind flags, formatting and preview image and read back identical; the categories All / Photos / Videos / Files / Links / Music / Voice filter on those stored facts and combine with search; messages saved while the Vault is locked keep kind flags, formatting and preview through the sealed inbox; records written by the previous app version still read; decrypted temp copies are overwritten and removed.
+
+NOT verified here (no Android SDK or device in the build sandbox; CI only proves the code compiles and the APK builds): how the chat looks and feels, photo/video/audio playback, the viewers, the attach picker, opening a document in another app, search box behaviour, the blur wall on a real device. These must be tried on a phone.

@@ -11,9 +11,14 @@ import org.telegram.messenger.vault.VaultRuntime;
 import org.telegram.messenger.vault.VaultStore;
 import org.telegram.tgnet.TLRPC;
 
+
+import org.telegram.messenger.vault.VaultEntities;
+
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * "Send to Vault": copies one chat message into the Protected Vault.
@@ -109,12 +114,15 @@ public final class VaultSender {
                 .source(mo.getDialogId(), mo.getId());
         String text = mo.messageOwner.message == null ? "" : mo.messageOwner.message;
         draft.text(text);
+        draft.entities(entitiesOf(mo.messageOwner.entities, text.length()));
         draft.senderName(senderName(account, mo));
         if (mo.messageOwner.fwd_from != null) {
             String from = mo.messageOwner.fwd_from.from_name;
             draft.forwardedFrom(from, mo.messageOwner.fwd_from.date * 1000L);
         }
         File file = null;
+        String mediaName = null, mediaMime = null;
+        int mediaDuration = 0;
         if (type.hasMedia()) {
             file = FileLoader.getInstance(account).getPathToMessage(mo.messageOwner);
             if (file == null || !file.exists() || file.length() == 0) {
@@ -123,14 +131,39 @@ public final class VaultSender {
             }
             String name = mo.getFileName();
             String mime = mo.getMimeType();
-            draft.media(name == null || name.isEmpty() ? "file" : name, mime == null ? "application/octet-stream" : mime,
-                    0, 0, (int) Math.max(0, mo.getDuration()));
+            int flags = 0;
+            if (mo.isVoice()) {
+                flags |= VaultItem.FLAG_VOICE;
+            } else if (mo.isMusic()) {
+                flags |= VaultItem.FLAG_MUSIC;
+            }
+            if (mo.isRoundVideo()) {
+                flags |= VaultItem.FLAG_ROUND_VIDEO;
+            }
+            if (mo.isGif()) {
+                flags |= VaultItem.FLAG_ANIMATION;
+            }
+            draft.flags(flags);
+            mediaName = name == null || name.isEmpty() ? "file" : name;
+            mediaMime = mime == null ? "application/octet-stream" : mime;
+            mediaDuration = (int) Math.max(0, mo.getDuration());
+            draft.media(mediaName, mediaMime, 0, 0, mediaDuration);
         }
+        final String mediaName0 = mediaName, mediaMime0 = mediaMime;
+        final int mediaDuration0 = mediaDuration;
         final File mediaFile = file;
         // the locked path must never queue behind a long network sync, so it has its own thread
         (locked ? rt.inboxIo() : rt.io()).execute(() -> {
             String message;
             try {
+                byte[] thumbnail = null;
+                if (mediaFile != null) {
+                    // preview and size are made off the UI thread
+                    VaultThumbs.Info info = VaultThumbs.make(org.telegram.messenger.ApplicationLoader.applicationContext,
+                            android.net.Uri.fromFile(mediaFile), type);
+                    thumbnail = info.thumbnail;
+                    draft.media(mediaName0, mediaMime0, info.width, info.height, mediaDuration0 > 0 ? mediaDuration0 : info.durationSeconds);
+                }
                 if (locked || !rt.keys.isUnlocked()) {
                     // The Vault may have locked since the check above: the sealed inbox still works.
                     long limit = VaultStore.DEFAULT_MAX_UPLOAD_BYTES;
@@ -138,7 +171,7 @@ public final class VaultSender {
                         rt.inbox.put(draft, null, limit);
                     } else {
                         try (InputStream in = new FileInputStream(mediaFile)) {
-                            rt.inbox.put(draft, in, limit);
+                            rt.inbox.put(draft, in, thumbnail, limit);
                         }
                     }
                     message = "Saved to the Protected Vault. It is encrypted and will appear when you open the Vault.";
@@ -147,7 +180,7 @@ public final class VaultSender {
                         rt.engine().addItem(draft, null, null);
                     } else {
                         try (InputStream in = new FileInputStream(mediaFile)) {
-                            rt.engine().addItem(draft, in, null);
+                            rt.engine().addItem(draft, in, thumbnail);
                         }
                     }
                     message = "Saved to the Protected Vault.";
@@ -173,6 +206,36 @@ public final class VaultSender {
             final String m = message;
             AndroidUtilities.runOnUIThread(() -> result.done(m));
         });
+    }
+
+    private static String entitiesOf(List<TLRPC.MessageEntity> in, int textLength) {
+        if (in == null || in.isEmpty()) {
+            return "";
+        }
+        List<VaultEntities.Entity> out = new ArrayList<>();
+        for (TLRPC.MessageEntity e : in) {
+            char k;
+            String url = null;
+            if (e instanceof TLRPC.TL_messageEntityBold) k = VaultEntities.BOLD;
+            else if (e instanceof TLRPC.TL_messageEntityItalic) k = VaultEntities.ITALIC;
+            else if (e instanceof TLRPC.TL_messageEntityUnderline) k = VaultEntities.UNDERLINE;
+            else if (e instanceof TLRPC.TL_messageEntityStrike) k = VaultEntities.STRIKE;
+            else if (e instanceof TLRPC.TL_messageEntityCode) k = VaultEntities.CODE;
+            else if (e instanceof TLRPC.TL_messageEntityPre) k = VaultEntities.PRE;
+            else if (e instanceof TLRPC.TL_messageEntityBlockquote) k = VaultEntities.QUOTE;
+            else if (e instanceof TLRPC.TL_messageEntitySpoiler) k = VaultEntities.SPOILER;
+            else if (e instanceof TLRPC.TL_messageEntityTextUrl) {
+                k = VaultEntities.TEXT_URL;
+                url = ((TLRPC.TL_messageEntityTextUrl) e).url;
+            } else if (e instanceof TLRPC.TL_messageEntityUrl) k = VaultEntities.URL;
+            else if (e instanceof TLRPC.TL_messageEntityMention) k = VaultEntities.MENTION;
+            else if (e instanceof TLRPC.TL_messageEntityHashtag) k = VaultEntities.HASHTAG;
+            else if (e instanceof TLRPC.TL_messageEntityEmail) k = VaultEntities.EMAIL;
+            else if (e instanceof TLRPC.TL_messageEntityPhone) k = VaultEntities.PHONE;
+            else continue; // e.g. custom emoji: not preserved
+            out.add(new VaultEntities.Entity(k, e.offset, e.length, url));
+        }
+        return VaultEntities.encode(out, textLength);
     }
 
     private static String senderName(int account, MessageObject mo) {

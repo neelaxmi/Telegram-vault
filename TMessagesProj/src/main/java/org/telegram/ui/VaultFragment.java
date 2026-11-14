@@ -25,6 +25,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import org.telegram.messenger.AndroidUtilities;
+import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.vault.LinkTransport;
@@ -33,12 +34,16 @@ import org.telegram.messenger.vault.SetupFlow;
 import org.telegram.messenger.vault.SetupSession;
 import org.telegram.messenger.vault.SyncCoordinator;
 import org.telegram.messenger.vault.VaultAccess;
+import org.telegram.messenger.vault.VaultCategory;
 import org.telegram.messenger.vault.VaultCryptoException;
+import org.telegram.messenger.vault.VaultTempFiles;
 import org.telegram.messenger.vault.VaultItem;
 import org.telegram.messenger.vault.VaultListModel;
 import org.telegram.messenger.vault.VaultRuntime;
 import org.telegram.messenger.vault.VaultSyncEngine;
 import org.telegram.messenger.vault.VaultStore;
+import org.telegram.ui.ActionBar.ActionBarMenu;
+import org.telegram.ui.ActionBar.ActionBarMenuItem;
 import org.telegram.ui.ActionBar.AlertDialog;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
@@ -63,6 +68,7 @@ import java.util.Date;
 public class VaultFragment extends BaseFragment {
 
     private static final int REQUEST_EXPORT = 7301;
+    private static final int REQUEST_ATTACH = 7302;
     private static final long MAX_INLINE_PHOTO_BYTES = 20L * 1024 * 1024;
 
     private VaultRuntime rt;
@@ -72,11 +78,10 @@ public class VaultFragment extends BaseFragment {
     private byte[] restoreBundle;
     private boolean restoreMode;
     private VaultListModel model;
-    private ListAdapter adapter;
+    private VaultChatAdapter adapter;
     private TextView statusView;
     private TextView selectionView;
     private Button deleteButton;
-    private EditText searchField;
     private String pendingExportItemId;
     private boolean destroyed;
     /** True while another app (the file picker) is on top: that must not lock the Vault. */
@@ -91,6 +96,7 @@ public class VaultFragment extends BaseFragment {
                 return android.os.SystemClock.elapsedRealtime();
             }
         }, SetupSession.DEFAULT_GRACE_MILLIS);
+        temp().wipeAll(); // a crash or kill may have left a decrypted copy behind
         rt.setOnLockedUi(new Runnable() {
             @Override
             public void run() {
@@ -103,8 +109,9 @@ public class VaultFragment extends BaseFragment {
         rt.setOnInboxDrained(new Runnable() {
             @Override
             public void run() {
-                if (!destroyed && model != null && searchField != null) {
-                    reload(searchField.getText().toString()); // items saved while locked just arrived
+                if (!destroyed && model != null) {
+                    scrollToEnd = true;
+                    reload(); // items saved while locked just arrived
                 }
             }
         });
@@ -125,6 +132,16 @@ public class VaultFragment extends BaseFragment {
         }
         rt.setOnLockedUi(null);
         rt.setOnInboxDrained(null);
+        closeViewer();
+        stopAudio();
+        if (mediaPool != null) {
+            mediaPool.shutdownNow();
+        }
+        if (openPool != null) {
+            openPool.shutdownNow();
+        }
+        temp().wipeAll();
+        thumbCache.evictAll();
         super.onFragmentDestroy();
     }
 
@@ -141,6 +158,17 @@ public class VaultFragment extends BaseFragment {
             public void onItemClick(int id) {
                 if (id == -1) {
                     finishFragment();
+                } else if (id == MENU_SYNC) {
+                    syncNow(true);
+                } else if (id == MENU_SELECT_ALL) {
+                    if (model != null) {
+                        model.selectAll();
+                        renderSelection();
+                    }
+                } else if (id == MENU_SETTINGS) {
+                    showSettings();
+                } else if (id == MENU_LOCK) {
+                    rt.lockNow();
                 }
             }
         });
@@ -165,6 +193,7 @@ public class VaultFragment extends BaseFragment {
         if (a != null) {
             a.getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
         }
+        launching = false; // back from the file picker or another app
         rt.autoLock.onForeground(); // locks first if the time away was too long
         if (container == null) {
             return;
@@ -267,8 +296,28 @@ public class VaultFragment extends BaseFragment {
             rotationPlan.cancel();
             rotationPlan = null;
         }
+        // nothing decrypted may outlive the lock: viewers, playback, temp copies, previews
+        closeViewer();
+        stopAudio();
+        if (mediaPool != null) {
+            mediaPool.shutdownNow();
+            mediaPool = null;
+        }
+        if (openPool != null) {
+            openPool.shutdownNow();
+            openPool = null;
+        }
+        temp().wipeAll();
+        thumbCache.evictAll();
+        thumbLoading.clear();
+        actionBar.createMenu().clearItems();
+        actionBar.setSubtitle(null);
+        searchQuery = "";
         model = null;
         adapter = null;
+        chatList = null;
+        composer = null;
+        statusView = null;
         container.removeAllViews();
     }
 
@@ -619,6 +668,11 @@ public class VaultFragment extends BaseFragment {
      */
     private void showUnlock(String message) {
         final Context c = container.getContext();
+        closeViewer();
+        stopAudio();
+        temp().wipeAll();
+        actionBar.createMenu().clearItems();
+        actionBar.setSubtitle(null);
         container.removeAllViews();
         final FrameLayout wall = new FrameLayout(c);
         wall.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
@@ -634,13 +688,21 @@ public class VaultFragment extends BaseFragment {
             View bubble = new View(c);
             android.graphics.drawable.GradientDrawable d = new android.graphics.drawable.GradientDrawable();
             d.setCornerRadius(AndroidUtilities.dp(16));
-            d.setColor(i % 2 == 0 ? 0xFF3A6EA5 : 0xFF5B6770);
+            d.setColor(i % 2 == 0 ? 0xFF3A6EA5 : 0xFF4E7FB5);
             bubble.setBackground(d);
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(AndroidUtilities.dp(widths[i]), AndroidUtilities.dp(i % 3 == 0 ? 64 : 44));
-            lp.gravity = i % 2 == 0 ? android.view.Gravity.START : android.view.Gravity.END;
+            lp.gravity = android.view.Gravity.END; // like Saved Messages: every bubble on the right
             lp.topMargin = AndroidUtilities.dp(10);
             decoy.addView(bubble, lp);
         }
+        View ghostBar = new View(c); // where the message box is in the real chat
+        android.graphics.drawable.GradientDrawable gb = new android.graphics.drawable.GradientDrawable();
+        gb.setCornerRadius(AndroidUtilities.dp(22));
+        gb.setColor(0xFF2B3A4C);
+        ghostBar.setBackground(gb);
+        LinearLayout.LayoutParams gp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, AndroidUtilities.dp(44));
+        gp.topMargin = AndroidUtilities.dp(18);
+        decoy.addView(ghostBar, gp);
         if (android.os.Build.VERSION.SDK_INT >= 31) {
             decoy.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(28f, 28f, android.graphics.Shader.TileMode.CLAMP));
         }
@@ -931,63 +993,195 @@ public class VaultFragment extends BaseFragment {
         showDialog(b.create());
     }
 
-    // ------------------------------------------------------------------ the Vault
+    // ------------------------------------------------------------------ the Vault: a Saved-Messages-style chat
+
+    private static final int MENU_SEARCH = 1;
+    private static final int MENU_MORE = 2;
+    private static final int MENU_SYNC = 3;
+    private static final int MENU_SELECT_ALL = 4;
+    private static final int MENU_SETTINGS = 5;
+    private static final int MENU_LOCK = 6;
+
+    private String searchQuery = "";
+    private VaultCategory category = VaultCategory.ALL;
+    private boolean scrollToEnd;
+    private ListView chatList;
+    private TextView emptyView;
+    private EditText composer;
+    private final java.util.Map<VaultCategory, TextView> chips = new java.util.EnumMap<>(VaultCategory.class);
+    private VaultTempFiles temp;
+    private java.util.concurrent.ExecutorService mediaPool;
+    private final android.util.LruCache<String, Bitmap> thumbCache = new android.util.LruCache<>(64);
+    private final java.util.Set<String> thumbLoading = new java.util.HashSet<>();
+    private android.media.MediaPlayer player;
+    private String playingId;
+    private boolean playerPaused;
+    private Dialog viewer;
+    private final Runnable audioTick = new Runnable() {
+        @Override
+        public void run() {
+            if (player != null && playingId != null && adapter != null) {
+                try {
+                    adapter.refreshAudio(playingId, player.getCurrentPosition(), player.getDuration());
+                } catch (IllegalStateException ignored) {
+                    return;
+                }
+                AndroidUtilities.runOnUIThread(this, 400);
+            }
+        }
+    };
+
+    private VaultTempFiles temp() {
+        if (temp == null) {
+            temp = new VaultTempFiles(new java.io.File(ApplicationLoader.applicationContext.getFilesDir(), "vault-open"));
+        }
+        return temp;
+    }
+
+    private void buildMenu() {
+        ActionBarMenu menu = actionBar.createMenu();
+        menu.clearItems();
+        ActionBarMenuItem search = menu.addItem(MENU_SEARCH, org.telegram.messenger.R.drawable.outline_header_search).setIsSearchField(true)
+                .setActionBarMenuItemSearchListener(new ActionBarMenuItem.ActionBarMenuItemSearchListener() {
+                    @Override
+                    public void onSearchCollapse() {
+                        searchQuery = "";
+                        reload();
+                    }
+
+                    @Override
+                    public void onTextChanged(EditText editText) {
+                        searchQuery = editText.getText().toString();
+                        reload();
+                    }
+                });
+        search.setSearchFieldHint("Search the Vault");
+        ActionBarMenuItem more = menu.addItem(MENU_MORE, org.telegram.messenger.R.drawable.ic_ab_other);
+        more.addSubItem(MENU_SYNC, "Sync now");
+        more.addSubItem(MENU_SELECT_ALL, "Select all");
+        more.addSubItem(MENU_SETTINGS, "Settings");
+        more.addSubItem(MENU_LOCK, "Lock now");
+    }
+
+    private TextView chip(Context c, final VaultCategory cat) {
+        TextView t = new TextView(c);
+        t.setText(cat.label);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(AndroidUtilities.dp(14), AndroidUtilities.dp(7), AndroidUtilities.dp(14), AndroidUtilities.dp(7));
+        t.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                category = cat;
+                styleChips();
+                scrollToEnd = true;
+                reload();
+            }
+        });
+        chips.put(cat, t);
+        return t;
+    }
+
+    private void styleChips() {
+        for (java.util.Map.Entry<VaultCategory, TextView> e : chips.entrySet()) {
+            boolean on = e.getKey() == category;
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setCornerRadius(AndroidUtilities.dp(18));
+            bg.setColor(on ? Theme.getColor(Theme.key_chat_messagePanelSend) : Theme.getColor(Theme.key_windowBackgroundGray));
+            e.getValue().setBackground(bg);
+            e.getValue().setTextColor(on ? 0xFFFFFFFF : Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
+        }
+    }
 
     private void showList() {
         final Context c = container.getContext();
         container.removeAllViews();
+        stopAudio();
+        temp().wipeAll();
+        thumbCache.evictAll();
+        thumbLoading.clear();
+        if (mediaPool != null) {
+            mediaPool.shutdownNow();
+        }
+        mediaPool = java.util.concurrent.Executors.newSingleThreadExecutor();
         model = new VaultListModel(rt.store);
-        adapter = new ListAdapter(c);
+        category = VaultCategory.ALL;
+        searchQuery = "";
+        scrollToEnd = true;
+        chips.clear();
+        buildMenu();
+        adapter = new VaultChatAdapter(c, model, new VaultChatAdapter.Host() {
+            @Override
+            public void loadThumbnail(VaultItem item, ImageView target) {
+                VaultFragment.this.loadThumbnail(item, target);
+            }
+
+            @Override
+            public int audioState(String itemId) {
+                return itemId.equals(playingId) ? (playerPaused ? 2 : 1) : 0;
+            }
+
+            @Override
+            public int audioPositionMs(String itemId) {
+                try {
+                    return itemId.equals(playingId) && player != null ? player.getCurrentPosition() : 0;
+                } catch (IllegalStateException e) {
+                    return 0;
+                }
+            }
+
+            @Override
+            public int audioLengthMs(String itemId) {
+                try {
+                    return itemId.equals(playingId) && player != null ? player.getDuration() : 0;
+                } catch (IllegalStateException e) {
+                    return 0;
+                }
+            }
+
+            @Override
+            public void onPlayPause(VaultItem item) {
+                toggleAudio(item);
+            }
+        });
 
         LinearLayout root = new LinearLayout(c);
         root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundGray));
 
-        LinearLayout bar = new LinearLayout(c);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(4), AndroidUtilities.dp(12), AndroidUtilities.dp(4));
         statusView = text(c, "", 13, false);
-        bar.addView(statusView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        bar.addView(button(c, "Sync", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                syncNow(true);
-            }
-        }));
-        bar.addView(button(c, "Settings", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                showSettings();
-            }
-        }));
-        bar.addView(button(c, "Lock", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                rt.lockNow();
-            }
-        }));
-        root.addView(bar);
+        statusView.setVisibility(View.GONE);
+        statusView.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(6), AndroidUtilities.dp(12), AndroidUtilities.dp(6));
+        root.addView(statusView);
 
-        searchField = field(c, "Search", false);
-        searchField.addTextChangedListener(new android.text.TextWatcher() {
-            @Override
-            public void beforeTextChanged(CharSequence s, int a, int b, int d) {
-            }
-
-            @Override
-            public void onTextChanged(CharSequence s, int a, int b, int d) {
-                reload(s.toString());
-            }
-
-            @Override
-            public void afterTextChanged(android.text.Editable s) {
-            }
-        });
-        root.addView(searchField);
+        android.widget.HorizontalScrollView chipScroll = new android.widget.HorizontalScrollView(c);
+        chipScroll.setHorizontalScrollBarEnabled(false);
+        chipScroll.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
+        LinearLayout chipRow = new LinearLayout(c);
+        chipRow.setOrientation(LinearLayout.HORIZONTAL);
+        chipRow.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(6), AndroidUtilities.dp(8), AndroidUtilities.dp(6));
+        for (VaultCategory cat : VaultCategory.values()) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.rightMargin = AndroidUtilities.dp(6);
+            chipRow.addView(chip(c, cat), lp);
+        }
+        chipScroll.addView(chipRow);
+        root.addView(chipScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        styleChips();
 
         LinearLayout selBar = new LinearLayout(c);
         selBar.setOrientation(LinearLayout.HORIZONTAL);
+        selBar.setGravity(Gravity.CENTER_VERTICAL);
+        selBar.setPadding(AndroidUtilities.dp(12), 0, AndroidUtilities.dp(4), 0);
+        selBar.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
         selectionView = text(c, "", 14, true);
         selBar.addView(selectionView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        selBar.addView(button(c, "Copy", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copySelected();
+            }
+        }));
         deleteButton = button(c, "Delete", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -1004,62 +1198,89 @@ public class VaultFragment extends BaseFragment {
         }));
         root.addView(selBar);
 
-        ListView list = new ListView(c);
-        list.setAdapter(adapter);
-        list.setOnItemClickListener(new android.widget.AdapterView.OnItemClickListener() {
+        FrameLayout listFrame = new FrameLayout(c);
+        chatList = new ListView(c);
+        chatList.setDivider(null);
+        chatList.setDividerHeight(0);
+        chatList.setSelector(new android.graphics.drawable.ColorDrawable(0));
+        chatList.setCacheColorHint(0);
+        chatList.setAdapter(adapter);
+        chatList.setOnItemClickListener(new android.widget.AdapterView.OnItemClickListener() {
             @Override
             public void onItemClick(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                if (model == null || position >= model.rows().size()) {
+                    return;
+                }
                 VaultListModel.Row row = model.rows().get(position);
                 if (model.isSelecting()) {
                     model.toggle(row.id);
                     renderSelection();
                 } else {
-                    openItem(row);
+                    openItem(row.item);
                 }
             }
         });
-        list.setOnItemLongClickListener(new android.widget.AdapterView.OnItemLongClickListener() {
+        chatList.setOnItemLongClickListener(new android.widget.AdapterView.OnItemLongClickListener() {
             @Override
             public boolean onItemLongClick(android.widget.AdapterView<?> parent, View view, int position, long id) {
-                model.toggle(model.rows().get(position).id);
-                renderSelection();
+                if (model == null || position >= model.rows().size()) {
+                    return true;
+                }
+                VaultListModel.Row row = model.rows().get(position);
+                if (model.isSelecting()) {
+                    model.toggle(row.id);
+                    renderSelection();
+                } else {
+                    showItemMenu(row.item);
+                }
                 return true;
             }
         });
-        root.addView(list, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        listFrame.addView(chatList, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        emptyView = text(c, "", 15, false);
+        emptyView.setGravity(Gravity.CENTER);
+        emptyView.setPadding(AndroidUtilities.dp(32), 0, AndroidUtilities.dp(32), 0);
+        listFrame.addView(emptyView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        root.addView(listFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        LinearLayout composer = new LinearLayout(c);
-        composer.setOrientation(LinearLayout.HORIZONTAL);
-        final EditText note = field(c, "Write a note to your Vault", false);
-        composer.addView(note, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        composer.addView(button(c, "Add", new View.OnClickListener() {
+        // composer: attach, text, send (like Saved Messages)
+        LinearLayout bar = new LinearLayout(c);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setBackgroundColor(Theme.getColor(Theme.key_chat_messagePanelBackground));
+        ImageView attach = new ImageView(c);
+        attach.setImageResource(org.telegram.messenger.R.drawable.input_attach);
+        attach.setColorFilter(Theme.getColor(Theme.key_chat_messagePanelIcons));
+        attach.setScaleType(ImageView.ScaleType.CENTER);
+        attach.setContentDescription("Attach files");
+        attach.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                final String t = note.getText().toString().trim();
-                if (t.isEmpty()) {
-                    return;
-                }
-                note.setText("");
-                background(new Job() {
-                    @Override
-                    public void run() throws Exception {
-                        rt.engine().addItem(new VaultItem.Draft(VaultItem.Type.TEXT).text(t), null, null);
-                    }
-                }, new Runnable() {
-                    @Override
-                    public void run() {
-                        reload(searchField.getText().toString());
-                        syncNow(false);
-                    }
-                }, new ErrorHandler() {
-                    @Override
-                    public void accept(VaultCryptoException e) {
-                        toast(messageFor(e));
-                    }
-                });
+                pickFiles();
             }
-        }));
-        root.addView(composer);
+        });
+        bar.addView(attach, new LinearLayout.LayoutParams(AndroidUtilities.dp(48), AndroidUtilities.dp(48)));
+        composer = new EditText(c);
+        composer.setHint("Message");
+        composer.setHintTextColor(Theme.getColor(Theme.key_chat_messagePanelHint));
+        composer.setTextColor(Theme.getColor(Theme.key_chat_messagePanelText));
+        composer.setBackground(null);
+        composer.setMaxLines(5);
+        composer.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        bar.addView(composer, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        ImageView send = new ImageView(c);
+        send.setImageResource(org.telegram.messenger.R.drawable.ic_send);
+        send.setColorFilter(Theme.getColor(Theme.key_chat_messagePanelSend));
+        send.setScaleType(ImageView.ScaleType.CENTER);
+        send.setContentDescription("Save to the Vault");
+        send.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                sendNote();
+            }
+        });
+        bar.addView(send, new LinearLayout.LayoutParams(AndroidUtilities.dp(48), AndroidUtilities.dp(48)));
+        root.addView(bar);
 
         container.addView(root, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         renderSelection();
@@ -1075,7 +1296,7 @@ public class VaultFragment extends BaseFragment {
                             public void run() {
                                 renderStatus(s);
                                 if (s.state == SyncCoordinator.State.IDLE) {
-                                    reload(searchField == null ? "" : searchField.getText().toString());
+                                    reload();
                                 } else if (s.state == SyncCoordinator.State.WAITING_RETRY) {
                                     AndroidUtilities.runOnUIThread(new Runnable() {
                                         @Override
@@ -1097,27 +1318,83 @@ public class VaultFragment extends BaseFragment {
         }, new ErrorHandler() {
             @Override
             public void accept(VaultCryptoException e) {
-                statusView.setText("Offline: " + messageFor(e));
+                if (statusView != null) {
+                    statusView.setVisibility(View.VISIBLE);
+                    statusView.setText("Offline: " + messageFor(e));
+                }
             }
         });
-        reload("");
+        reload();
     }
 
-    private void reload(final String query) {
-        if (model == null) {
+    private void sendNote() {
+        if (composer == null) {
             return;
         }
-        final VaultListModel m = model;
+        final String t = composer.getText().toString().trim();
+        if (t.isEmpty()) {
+            return;
+        }
+        composer.setText("");
         background(new Job() {
             @Override
             public void run() throws Exception {
-                m.setQuery(query);
+                rt.engine().addItem(new VaultItem.Draft(VaultItem.Type.TEXT).text(t), null, null);
             }
         }, new Runnable() {
             @Override
             public void run() {
-                if (adapter != null) {
-                    adapter.notifyDataSetChanged();
+                scrollToEnd = true;
+                reload();
+                syncNow(false);
+            }
+        }, new ErrorHandler() {
+            @Override
+            public void accept(VaultCryptoException e) {
+                toast(messageFor(e));
+            }
+        });
+    }
+
+    private void reload() {
+        if (model == null) {
+            return;
+        }
+        final VaultListModel m = model;
+        final VaultCategory cat = category;
+        final String q = searchQuery;
+        background(new Job() {
+            @Override
+            public void run() throws Exception {
+                boolean catChanged = m.category() != cat;
+                boolean qChanged = !m.query().equals(q);
+                if (catChanged) {
+                    m.setCategory(cat);
+                }
+                if (qChanged) {
+                    m.setQuery(q);
+                }
+                if (!catChanged && !qChanged) {
+                    m.refresh();
+                }
+            }
+        }, new Runnable() {
+            @Override
+            public void run() {
+                if (adapter == null || model != m) {
+                    return;
+                }
+                adapter.notifyDataSetChanged();
+                int n = m.rows().size();
+                if (emptyView != null) {
+                    emptyView.setVisibility(n == 0 ? View.VISIBLE : View.GONE);
+                    emptyView.setText(!q.trim().isEmpty() ? "Nothing found." : cat == VaultCategory.ALL
+                            ? "Your Vault is empty.\nSave messages here with \"Send to Vault\", or write a note and attach files below."
+                            : "No " + cat.label.toLowerCase(java.util.Locale.ROOT) + " in the Vault yet.");
+                }
+                if (scrollToEnd && chatList != null && n > 0) {
+                    chatList.setSelection(n - 1);
+                    scrollToEnd = false;
                 }
                 renderSelection();
             }
@@ -1141,14 +1418,151 @@ public class VaultFragment extends BaseFragment {
         }
     }
 
+    // ------------------------------------------------------------------ previews
+
+    private void loadThumbnail(final VaultItem item, final ImageView target) {
+        Bitmap cached = thumbCache.get(item.id);
+        if (cached != null) {
+            target.setImageBitmap(cached);
+            return;
+        }
+        target.setImageDrawable(null);
+        final boolean canMakeFromPhoto = item.type == VaultItem.Type.PHOTO && item.mediaSize <= 8L * 1024 * 1024;
+        if (item.thumbnailId == null && !canMakeFromPhoto) {
+            return; // a video saved without a preview: the grey box with the play mark stays
+        }
+        if (!thumbLoading.add(item.id) || mediaPool == null) {
+            return;
+        }
+        final java.util.concurrent.ExecutorService pool = mediaPool;
+        pool.execute(new Runnable() {
+            @Override
+            public void run() {
+                Bitmap bmp = null;
+                try {
+                    byte[] b = null;
+                    if (item.thumbnailId != null) {
+                        try {
+                            b = rt.store.readThumbnail(item.id); // local copy
+                        } catch (Exception local) {
+                            VaultSyncEngine e = rt.engine();
+                            b = e == null ? null : e.readThumbnail(item.id); // fetches it from the channel if needed
+                        }
+                    }
+                    if (b != null) {
+                        bmp = BitmapFactory.decodeByteArray(b, 0, b.length);
+                    } else if (canMakeFromPhoto) {
+                        ByteArrayOutputStream out = new ByteArrayOutputStream();
+                        VaultSyncEngine e = rt.engine();
+                        if (e != null) {
+                            e.openMedia(item.id, out);
+                            bmp = VaultThumbs.decodeSmall(out.toByteArray()); // in memory only
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    // no preview: the placeholder box stays
+                }
+                final Bitmap result = bmp;
+                ui(new Runnable() {
+                    @Override
+                    public void run() {
+                        thumbLoading.remove(item.id);
+                        if (result != null && mediaPool == pool) {
+                            thumbCache.put(item.id, result);
+                            if (adapter != null) {
+                                adapter.notifyDataSetChanged();
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------ item menu and selection helpers
+
+    private void showItemMenu(final VaultItem item) {
+        final java.util.List<String> labels = new java.util.ArrayList<>();
+        final java.util.List<Integer> ids = new java.util.ArrayList<>();
+        labels.add("Select");
+        ids.add(0);
+        if (item.text != null && !item.text.isEmpty()) {
+            labels.add("Copy text");
+            ids.add(1);
+        }
+        if (item.mediaId != null) {
+            labels.add("Open");
+            ids.add(2);
+            labels.add("Export…");
+            ids.add(3);
+        }
+        labels.add("Delete");
+        ids.add(4);
+        AlertDialog.Builder b = new AlertDialog.Builder(getParentActivity());
+        b.setItems(labels.toArray(new CharSequence[0]), new android.content.DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(android.content.DialogInterface dialog, int which) {
+                switch (ids.get(which)) {
+                    case 0:
+                        model.toggle(item.id);
+                        renderSelection();
+                        break;
+                    case 1:
+                        copyText(item.text);
+                        break;
+                    case 2:
+                        openItem(item);
+                        break;
+                    case 3:
+                        startExport(item);
+                        break;
+                    default:
+                        model.clearSelection();
+                        model.toggle(item.id);
+                        renderSelection();
+                        confirmDelete();
+                        break;
+                }
+            }
+        });
+        showDialog(b.create());
+    }
+
+    private void copyText(String t) {
+        android.content.ClipboardManager cm = (android.content.ClipboardManager) getParentActivity().getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm != null && t != null) {
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("Vault", t));
+            toast("Copied");
+        }
+    }
+
+    private void copySelected() {
+        StringBuilder sb = new StringBuilder();
+        for (VaultListModel.Row r : model.rows()) {
+            if (r.selected && r.item.text != null && !r.item.text.isEmpty()) {
+                if (sb.length() > 0) {
+                    sb.append("\n\n");
+                }
+                sb.append(r.item.text);
+            }
+        }
+        if (sb.length() == 0) {
+            toast("The selected messages have no text to copy.");
+            return;
+        }
+        copyText(sb.toString());
+    }
+
     private void renderStatus(SyncCoordinator.Status s) {
         if (statusView == null) {
             return;
         }
         String t;
+        boolean notice = true;
         switch (s.state) {
             case SYNCING:
-                t = "Syncing…";
+                t = "Syncing\u2026";
+                notice = false;
                 break;
             case WAITING_RETRY:
                 t = "Sync paused, will retry (" + s.pendingItems + " waiting)";
@@ -1161,10 +1575,14 @@ public class VaultFragment extends BaseFragment {
                 break;
             case LOCKED:
                 t = "Locked";
+                notice = false;
                 break;
             default:
                 t = s.pendingItems > 0 ? s.pendingItems + " waiting to sync" : "Synced";
+                notice = false;
         }
+        actionBar.setSubtitle(notice ? "Sync problem" : t);
+        statusView.setVisibility(notice ? View.VISIBLE : View.GONE);
         statusView.setText(t);
         statusView.setOnClickListener(s.state == SyncCoordinator.State.NEEDS_RESTORE ? new View.OnClickListener() {
             @Override
@@ -1197,7 +1615,7 @@ public class VaultFragment extends BaseFragment {
                 }, new Runnable() {
                     @Override
                     public void run() {
-                        reload(searchField.getText().toString());
+                        reload();
                         syncNow(false);
                     }
                 }, new ErrorHandler() {
@@ -1218,104 +1636,339 @@ public class VaultFragment extends BaseFragment {
 
     // ------------------------------------------------------------------ opening items
 
-    private void openItem(final VaultListModel.Row row) {
-        background(new Job() {
+    private interface TempReady {
+        void ready(java.io.File f);
+    }
+
+    private java.util.concurrent.ExecutorService openPool;
+
+    private java.util.concurrent.ExecutorService openPool() {
+        if (openPool == null) {
+            openPool = java.util.concurrent.Executors.newSingleThreadExecutor();
+        }
+        return openPool;
+    }
+
+    /** Decrypts a stored file into the private, short-lived temp folder (streamed, never all in memory). */
+    private void decryptToTemp(final VaultItem item, final TempReady done, final Runnable failed) {
+        final java.util.concurrent.ExecutorService pool = openPool();
+        pool.execute(new Runnable() {
             @Override
-            public void run() throws Exception {
-                final VaultItem item = rt.store.get(row.id);
-                if (item == null) {
-                    return;
-                }
-                if (item.mediaId == null) {
-                    final String text = item.text == null ? "" : item.text;
+            public void run() {
+                java.io.File f = null;
+                try {
+                    f = temp().create(item.mediaName);
+                    try (java.io.FileOutputStream o = new java.io.FileOutputStream(f)) {
+                        rt.engine().openMedia(item.id, o);
+                    }
+                    final java.io.File ready = f;
                     ui(new Runnable() {
                         @Override
                         public void run() {
-                            AlertDialog.Builder b = new AlertDialog.Builder(getParentActivity());
-                            b.setMessage(text);
-                            b.setPositiveButton("Close", null);
-                            showDialog(b.create());
+                            if (rt.keys.isUnlocked() && openPool == pool) {
+                                done.ready(ready);
+                            } else {
+                                temp().release(ready);
+                            }
                         }
                     });
-                } else if (item.type == VaultItem.Type.PHOTO && item.mediaSize <= MAX_INLINE_PHOTO_BYTES) {
-                    ByteArrayOutputStream out = new ByteArrayOutputStream();
-                    rt.engine().openMedia(item.id, out); // decrypted in memory only, never written to disk
-                    final byte[] bytes = out.toByteArray();
+                } catch (final Throwable t) {
+                    temp().release(f);
                     ui(new Runnable() {
                         @Override
                         public void run() {
-                            showPhoto(bytes, item);
-                        }
-                    });
-                } else {
-                    ui(new Runnable() {
-                        @Override
-                        public void run() {
-                            offerExport(item);
+                            toast(t instanceof VaultCryptoException ? messageFor((VaultCryptoException) t) : "Could not open the file.");
+                            if (failed != null) {
+                                failed.run();
+                            }
                         }
                     });
                 }
-            }
-        }, null, new ErrorHandler() {
-            @Override
-            public void accept(VaultCryptoException e) {
-                toast(messageFor(e));
             }
         });
     }
 
-    private void showPhoto(byte[] bytes, VaultItem item) {
-        BitmapFactory.Options bounds = new BitmapFactory.Options();
-        bounds.inJustDecodeBounds = true;
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
-        int sample = 1;
-        while (bounds.outWidth / sample > 2048 || bounds.outHeight / sample > 2048) {
-            sample *= 2;
+    private void openItem(final VaultItem item) {
+        if (item.mediaId == null) {
+            return; // text: links and spoilers are tapped in the bubble itself
         }
-        BitmapFactory.Options o = new BitmapFactory.Options();
-        o.inSampleSize = sample;
-        Bitmap bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.length, o);
-        if (bmp == null) {
-            offerExport(item);
+        if (item.type == VaultItem.Type.PHOTO && item.mediaSize <= MAX_INLINE_PHOTO_BYTES) {
+            final java.util.concurrent.ExecutorService pool = openPool();
+            pool.execute(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        ByteArrayOutputStream out = new ByteArrayOutputStream();
+                        rt.engine().openMedia(item.id, out); // decrypted in memory only, never written to disk
+                        final Bitmap bmp = VaultThumbs.decodeFull(out.toByteArray());
+                        ui(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (bmp == null) {
+                                    offerExport(item);
+                                } else if (rt.keys.isUnlocked() && openPool == pool) {
+                                    closeViewer();
+                                    viewer = VaultMediaViews.showPhoto(getParentActivity(), bmp, item.text, new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            startExport(item);
+                                        }
+                                    }, new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            viewer = null;
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    } catch (final Throwable t) {
+                        ui(new Runnable() {
+                            @Override
+                            public void run() {
+                                toast(t instanceof VaultCryptoException ? messageFor((VaultCryptoException) t) : "Could not open the photo.");
+                            }
+                        });
+                    }
+                }
+            });
+        } else if (item.type == VaultItem.Type.VIDEO) {
+            toast("Opening video…");
+            decryptToTemp(item, new TempReady() {
+                @Override
+                public void ready(final java.io.File f) {
+                    stopAudio();
+                    closeViewer();
+                    viewer = VaultMediaViews.showVideo(getParentActivity(), f, new Runnable() {
+                        @Override
+                        public void run() {
+                            startExport(item);
+                        }
+                    }, new Runnable() {
+                        @Override
+                        public void run() {
+                            viewer = null;
+                            temp().release(f);
+                        }
+                    });
+                }
+            }, null);
+        } else if (item.isVoice() || VaultCategory.isMusic(item)) {
+            toggleAudio(item);
+        } else {
+            offerOpenOrExport(item);
+        }
+    }
+
+    private void closeViewer() {
+        Dialog d = viewer;
+        viewer = null;
+        if (d != null) {
+            try {
+                d.dismiss();
+            } catch (RuntimeException ignored) {
+                // already gone
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ voice and music
+
+    private void toggleAudio(final VaultItem item) {
+        if (item.id.equals(playingId) && player != null) {
+            try {
+                if (player.isPlaying()) {
+                    player.pause();
+                    playerPaused = true;
+                    AndroidUtilities.cancelRunOnUIThread(audioTick);
+                } else {
+                    player.start();
+                    playerPaused = false;
+                    AndroidUtilities.runOnUIThread(audioTick, 400);
+                }
+            } catch (IllegalStateException e) {
+                stopAudio();
+            }
+            if (adapter != null) {
+                adapter.notifyDataSetChanged();
+            }
             return;
         }
-        ImageView iv = new ImageView(getParentActivity());
-        iv.setImageBitmap(bmp);
-        iv.setAdjustViewBounds(true);
-        AlertDialog.Builder b = new AlertDialog.Builder(getParentActivity());
-        b.setView(iv);
-        b.setPositiveButton("Close", null);
-        b.setNegativeButton("Export…", new AlertDialog.OnButtonClickListener() {
+        stopAudio();
+        playingId = item.id;
+        playerPaused = false;
+        if (adapter != null) {
+            adapter.notifyDataSetChanged();
+        }
+        decryptToTemp(item, new TempReady() {
             @Override
-            public void onClick(AlertDialog d, int which) {
-                offerExport(item);
+            public void ready(final java.io.File f) {
+                if (!item.id.equals(playingId)) {
+                    temp().release(f);
+                    return;
+                }
+                final android.media.MediaPlayer mp = new android.media.MediaPlayer();
+                playingFile = f;
+                try {
+                    mp.setDataSource(f.getAbsolutePath());
+                    mp.setOnCompletionListener(new android.media.MediaPlayer.OnCompletionListener() {
+                        @Override
+                        public void onCompletion(android.media.MediaPlayer m) {
+                            stopAudio();
+                        }
+                    });
+                    mp.setOnErrorListener(new android.media.MediaPlayer.OnErrorListener() {
+                        @Override
+                        public boolean onError(android.media.MediaPlayer m, int what, int extra) {
+                            toast("This audio cannot be played on this device. Use Export instead.");
+                            stopAudio();
+                            return true;
+                        }
+                    });
+                    mp.setOnPreparedListener(new android.media.MediaPlayer.OnPreparedListener() {
+                        @Override
+                        public void onPrepared(android.media.MediaPlayer m) {
+                            if (m == player) {
+                                m.start();
+                                AndroidUtilities.runOnUIThread(audioTick, 400);
+                            }
+                        }
+                    });
+                    player = mp;
+                    mp.prepareAsync();
+                } catch (Exception e) {
+                    mp.release();
+                    player = null;
+                    stopAudio();
+                    toast("This audio cannot be played on this device. Use Export instead.");
+                }
+            }
+        }, new Runnable() {
+            @Override
+            public void run() {
+                stopAudio();
             }
         });
-        showDialog(b.create());
     }
 
-    private void offerExport(final VaultItem item) {
+    private java.io.File playingFile;
+
+    private void stopAudio() {
+        AndroidUtilities.cancelRunOnUIThread(audioTick);
+        android.media.MediaPlayer p = player;
+        player = null;
+        if (p != null) {
+            try {
+                p.release();
+            } catch (RuntimeException ignored) {
+                // already released
+            }
+        }
+        if (playingFile != null) {
+            temp().release(playingFile);
+            playingFile = null;
+        }
+        boolean was = playingId != null;
+        playingId = null;
+        playerPaused = false;
+        if (was && adapter != null) {
+            adapter.notifyDataSetChanged();
+        }
+    }
+
+    // ------------------------------------------------------------------ other documents, export, attach
+
+    private void offerOpenOrExport(final VaultItem item) {
         AlertDialog.Builder b = new AlertDialog.Builder(getParentActivity());
         b.setTitle(item.mediaName == null ? "File" : item.mediaName);
-        b.setMessage("This file cannot be shown inside the Vault yet. You can export a decrypted copy to a place you choose. The copy is no longer protected by the Vault.");
-        b.setPositiveButton("Export…", new AlertDialog.OnButtonClickListener() {
+        b.setMessage(android.text.format.Formatter.formatShortFileSize(getParentActivity(), item.mediaSize)
+                + "\n\nOpen decrypts a temporary copy that only the app you choose can read; it is erased when the Vault locks. "
+                + "Export saves a decrypted copy where you choose, outside the Vault's protection.");
+        b.setPositiveButton("Open", new AlertDialog.OnButtonClickListener() {
             @Override
             public void onClick(AlertDialog d, int which) {
-                pendingExportItemId = item.id;
-                Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                i.addCategory(Intent.CATEGORY_OPENABLE);
-                i.setType(item.mimeType == null || item.mimeType.isEmpty() ? "application/octet-stream" : item.mimeType);
-                i.putExtra(Intent.EXTRA_TITLE, item.mediaName == null ? "vault-file" : item.mediaName);
-                launching = true;
-                getParentActivity().startActivityForResult(i, REQUEST_EXPORT);
+                toast("Opening…");
+                decryptToTemp(item, new TempReady() {
+                    @Override
+                    public void ready(java.io.File f) {
+                        try {
+                            Uri uri = androidx.core.content.FileProvider.getUriForFile(getParentActivity(),
+                                    ApplicationLoader.getApplicationId() + ".provider", f);
+                            Intent i = new Intent(Intent.ACTION_VIEW);
+                            i.setDataAndType(uri, item.mimeType == null || item.mimeType.isEmpty() ? "application/octet-stream" : item.mimeType);
+                            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                            launching = true;
+                            getParentActivity().startActivity(i);
+                        } catch (Exception e) {
+                            launching = false;
+                            temp().release(f);
+                            toast("No app on this phone can open this type of file. Use Export instead.");
+                        }
+                    }
+                }, null);
+            }
+        });
+        b.setNeutralButton("Export…", new AlertDialog.OnButtonClickListener() {
+            @Override
+            public void onClick(AlertDialog d, int which) {
+                startExport(item);
             }
         });
         b.setNegativeButton("Cancel", null);
         showDialog(b.create());
     }
 
+    private void offerExport(final VaultItem item) {
+        AlertDialog.Builder b = new AlertDialog.Builder(getParentActivity());
+        b.setTitle(item.mediaName == null ? "File" : item.mediaName);
+        b.setMessage("This file cannot be shown inside the Vault. You can export a decrypted copy to a place you choose. The copy is no longer protected by the Vault.");
+        b.setPositiveButton("Export…", new AlertDialog.OnButtonClickListener() {
+            @Override
+            public void onClick(AlertDialog d, int which) {
+                startExport(item);
+            }
+        });
+        b.setNegativeButton("Cancel", null);
+        showDialog(b.create());
+    }
+
+    private void startExport(VaultItem item) {
+        pendingExportItemId = item.id;
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType(item.mimeType == null || item.mimeType.isEmpty() ? "application/octet-stream" : item.mimeType);
+        i.putExtra(Intent.EXTRA_TITLE, item.mediaName == null ? "vault-file" : item.mediaName);
+        launching = true;
+        getParentActivity().startActivityForResult(i, REQUEST_EXPORT);
+    }
+
+    private void pickFiles() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        launching = true;
+        getParentActivity().startActivityForResult(i, REQUEST_ATTACH);
+    }
+
     @Override
     public void onActivityResultFragment(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQUEST_ATTACH) {
+            launching = false;
+            if (resultCode != Activity.RESULT_OK || data == null || model == null) {
+                return;
+            }
+            final java.util.List<Uri> uris = new java.util.ArrayList<>();
+            if (data.getClipData() != null) {
+                for (int k = 0; k < data.getClipData().getItemCount(); k++) {
+                    uris.add(data.getClipData().getItemAt(k).getUri());
+                }
+            } else if (data.getData() != null) {
+                uris.add(data.getData());
+            }
+            importFiles(uris);
+            return;
+        }
         if (requestCode == REQUEST_EXPORT) {
             launching = false;
         }
@@ -1347,6 +2000,100 @@ public class VaultFragment extends BaseFragment {
                 toast(messageFor(e));
             }
         });
+    }
+
+    /** Saves the picked files as what they are (photo, video, music, document); the text box becomes the first caption. */
+    private void importFiles(final java.util.List<Uri> uris) {
+        if (uris.isEmpty()) {
+            return;
+        }
+        final String caption = composer == null ? "" : composer.getText().toString().trim();
+        if (composer != null) {
+            composer.setText("");
+        }
+        final android.content.ContentResolver cr = getParentActivity().getContentResolver();
+        final Context app = ApplicationLoader.applicationContext;
+        final int[] saved = new int[1];
+        final String[] firstError = new String[1];
+        background(new Job() {
+            @Override
+            public void run() throws Exception {
+                for (int k = 0; k < uris.size(); k++) {
+                    try {
+                        importOne(app, cr, uris.get(k), k == 0 ? caption : "");
+                        saved[0]++;
+                    } catch (VaultCryptoException e) {
+                        if (firstError[0] == null) {
+                            firstError[0] = messageFor(e);
+                        }
+                    } catch (Exception e) {
+                        if (firstError[0] == null) {
+                            firstError[0] = "Could not read one of the files.";
+                        }
+                    }
+                }
+            }
+        }, new Runnable() {
+            @Override
+            public void run() {
+                toast((saved[0] > 0 ? "Saved " + saved[0] + " to the Vault." : "Nothing was saved.")
+                        + (firstError[0] != null ? " " + firstError[0] : ""));
+                scrollToEnd = true;
+                reload();
+                syncNow(false);
+            }
+        }, new ErrorHandler() {
+            @Override
+            public void accept(VaultCryptoException e) {
+                toast(messageFor(e));
+            }
+        });
+    }
+
+    private void importOne(Context app, android.content.ContentResolver cr, Uri uri, String caption) throws Exception {
+        String mime = cr.getType(uri);
+        if (mime == null || mime.isEmpty()) {
+            mime = "application/octet-stream";
+        }
+        String name = null;
+        try (android.database.Cursor q = cr.query(uri, null, null, null, null)) {
+            if (q != null && q.moveToFirst()) {
+                int ni = q.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if (ni >= 0) {
+                    name = q.getString(ni);
+                }
+            }
+        }
+        if (name == null || name.isEmpty()) {
+            name = "file";
+        }
+        VaultItem.Type type = VaultItem.Type.DOCUMENT;
+        int flags = 0;
+        if (mime.startsWith("image/") && !mime.equals("image/svg+xml")) {
+            type = VaultItem.Type.PHOTO;
+        } else if (mime.startsWith("video/")) {
+            type = VaultItem.Type.VIDEO;
+        } else if (mime.startsWith("audio/")) {
+            flags = VaultItem.FLAG_MUSIC;
+        }
+        VaultThumbs.Info info = new VaultThumbs.Info();
+        if (type == VaultItem.Type.PHOTO || type == VaultItem.Type.VIDEO) {
+            info = VaultThumbs.make(app, uri, type);
+            if (type == VaultItem.Type.PHOTO && info.width <= 0) {
+                type = VaultItem.Type.DOCUMENT; // not a picture Android can read: keep it as a file
+                info = new VaultThumbs.Info();
+            }
+        } else if (flags == VaultItem.FLAG_MUSIC) {
+            info.durationSeconds = VaultThumbs.audioSeconds(app, uri);
+        }
+        VaultItem.Draft d = new VaultItem.Draft(type).text(caption).flags(flags)
+                .media(name, mime, info.width, info.height, info.durationSeconds);
+        try (InputStream in = cr.openInputStream(uri)) {
+            if (in == null) {
+                throw new IOException("Could not open the file");
+            }
+            rt.engine().addItem(d, in, info.thumbnail);
+        }
     }
 
 
@@ -1763,59 +2510,5 @@ public class VaultFragment extends BaseFragment {
         });
         b.setNegativeButton("Cancel", null);
         showDialog(b.create());
-    }
-
-    // ------------------------------------------------------------------ list adapter
-
-    private final class ListAdapter extends BaseAdapter {
-        private final Context context;
-
-        ListAdapter(Context context) {
-            this.context = context;
-        }
-
-        @Override
-        public int getCount() {
-            return model == null ? 0 : model.rows().size();
-        }
-
-        @Override
-        public Object getItem(int position) {
-            return model.rows().get(position);
-        }
-
-        @Override
-        public long getItemId(int position) {
-            return position;
-        }
-
-        @Override
-        public View getView(int position, View convertView, ViewGroup parent) {
-            VaultListModel.Row row = model.rows().get(position);
-            // Telegram-style message bubble: rounded, text first, time at the bottom right.
-            FrameLayout outer = new FrameLayout(context);
-            outer.setPadding(AndroidUtilities.dp(10), AndroidUtilities.dp(4), AndroidUtilities.dp(48), AndroidUtilities.dp(4));
-            LinearLayout l = new LinearLayout(context);
-            l.setOrientation(LinearLayout.VERTICAL);
-            l.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(6));
-            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
-            bg.setCornerRadii(new float[]{AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(16),
-                    AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(4), AndroidUtilities.dp(4)});
-            bg.setColor(row.selected ? Theme.getColor(Theme.key_windowBackgroundGray) : Theme.getColor(Theme.key_chat_inBubble));
-            l.setBackground(bg);
-            TextView title = text(context, row.title, 16, false);
-            title.setTextColor(Theme.getColor(Theme.key_chat_messageTextIn));
-            l.addView(title);
-            String sub = DateFormat.getTimeInstance(DateFormat.SHORT).format(new Date(row.dateMillis));
-            if (!row.subtitle.isEmpty()) {
-                sub = row.subtitle + " · " + sub;
-            }
-            TextView subtitle = text(context, sub, 11, false);
-            subtitle.setTextColor(Theme.getColor(Theme.key_chat_inTimeText));
-            subtitle.setGravity(android.view.Gravity.END);
-            l.addView(subtitle);
-            outer.addView(l, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, android.view.Gravity.START));
-            return outer;
-        }
     }
 }
